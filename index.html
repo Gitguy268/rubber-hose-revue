@@ -1,0 +1,39 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT. Copyright (c) 2026 Lucas Van De Weerd. See LICENSE. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
+<title>The Rubber Hose Revue</title>
+<style>
+  /* An intertitle card in plain CSS: system serif fonts only, no assets. */
+  html, body { height: 100%; margin: 0; }
+  body { display: grid; place-items: center; background: #0b0a08; color: #efe3c8;
+         font-family: Georgia, "Times New Roman", Times, serif; }
+  main { margin: 28px; padding: clamp(24px, 6vw, 56px); max-width: 34rem; text-align: center;
+         border: 4px double #efe3c8; outline: 1px solid #efe3c8; outline-offset: 8px; }
+  h1 { margin: 0; font-size: clamp(1.8rem, 7vw, 3.2rem); letter-spacing: .12em; text-transform: uppercase; line-height: 1.15; }
+  p { font-style: italic; margin: .8em 0; }
+  hr { border: 0; border-top: 1px solid #efe3c8; width: 40%; margin: 1.4em auto; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { margin: 1.1em 0; }
+  a { color: inherit; font-size: 1.35rem; font-variant: small-caps; letter-spacing: .14em; text-underline-offset: .3em; }
+  a:hover, a:focus-visible { background: #efe3c8; color: #0b0a08; outline: none; text-decoration: none; padding: .1em .4em; }
+  small { display: block; font-style: italic; margin-top: .3em; opacity: .8; }
+</style>
+</head>
+<body>
+<main>
+  <p>A programme in two parts</p>
+  <h1>The Rubber Hose Revue</h1>
+  <hr>
+  <ul>
+    <li><a href="cartoon.html">The Picture</a>
+      <small>A rooftop frolic with musical saw. Click to start; M mutes, S toggles sepia, F steadies the picture.</small></li>
+    <li><a href="asteroids.html">The Game</a>
+      <small>Cannonball Capers. Arrows steer and thrust, Space fires, P pauses, M mutes, S toggles sepia, F steadies the picture. Touch screens get buttons, and a gamepad works too.</small></li>
+  </ul>
+</main>
+</body>
+</html>

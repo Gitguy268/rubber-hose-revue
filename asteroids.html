@@ -1,0 +1,851 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT. Copyright (c) 2026 Lucas Van De Weerd. See LICENSE. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Cannonball Capers: a Rubber Hose Revue game</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+               touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  /* Touch buttons: real buttons above the canvas, shown on touch screens only. */
+  #pad { display: none; }
+  @media (pointer: coarse) { #pad { display: block; } }
+  body.touch #pad { display: block; }
+  #pad button { position: fixed; width: 68px; height: 68px; padding: 0; border-radius: 50%;
+                border: 2px solid rgba(241, 227, 200, .75); background: rgba(12, 12, 12, .45); color: #f1e3c8;
+                font: bold 24px Georgia, "Times New Roman", Times, serif; touch-action: none; -webkit-tap-highlight-color: transparent; }
+  #pad button.on { background: rgba(241, 227, 200, .85); color: #0c0c0c; }
+  #pad .low { bottom: calc(22px + env(safe-area-inset-bottom)); }
+  #pad .small { top: 62px; width: 44px; height: 44px; font-size: 15px; }
+</style>
+</head>
+<body>
+<canvas id="c" role="img" aria-label="Cannonball Capers, an Asteroids-style game. Arrow keys steer and thrust, Space fires, P pauses, M mutes, S toggles sepia, F steadies the picture. On a touch screen, use the buttons. On a gamepad, the stick or d-pad steers and thrusts, A fires, Start pauses."></canvas>
+<div id="pad">
+  <button class="low" data-code="ArrowLeft" aria-label="Rotate left" style="left:16px">&#9664;&#xFE0E;</button>
+  <button class="low" data-code="ArrowRight" aria-label="Rotate right" style="left:96px">&#9654;&#xFE0E;</button>
+  <button class="low" data-code="ArrowUp" aria-label="Thrust" style="right:96px">&#9650;&#xFE0E;</button>
+  <button class="low" data-code="Space" aria-label="Fire" style="right:16px">&#9679;</button>
+  <button class="small" data-code="KeyP" aria-label="Pause" style="left:16px">II</button>
+  <button class="small" data-code="KeyM" aria-label="Mute" style="right:16px">&#9834;&#xFE0E;</button>
+</div>
+<script>
+'use strict';
+/*
+  CANNONBALL CAPERS: Asteroids, as a 1920s cartoon short. Canvas 2D and Web Audio only, no assets.
+
+  Keys: Left/Right rotate, Up thrusts, Space fires, P pauses, M mutes, S toggles sepia,
+        F steadies the picture (no flicker, weave or scratches; on by default when the system
+        asks for reduced motion). Touch screens get on-screen buttons; a tap is "any key".
+  Gamepad: left stick or d-pad steers and thrusts, A fires, Start pauses; a crash rumbles the pad.
+  URL flag: ?selftest plays through the rules without a keyboard and logs SELFTEST PASS/FAIL.
+*/
+
+// ==================== TUNABLE CONSTANTS ====================
+// Distances are in world units: the shorter side of the window is always VIEW_UNITS long.
+const VIEW_UNITS = 600;
+const SHIP_THRUST = 300;          // acceleration while Up is held, units/s²
+const SHIP_MAX_SPEED = 340;       // units/s
+const SHIP_ROTATION_RATE = 3.8;   // radians/s
+const SHIP_FRICTION = 0.4;        // fraction of speed lost each second when coasting
+const FIRE_RATE = 5;              // shots per second while Space is held
+const BULLET_SPEED = 520;         // units/s
+const BULLET_LIFE = 0.95;         // seconds
+const START_ASTEROIDS = 4;        // large cannonballs on reel one
+const ASTEROIDS_PER_LEVEL = 1;    // extra large cannonballs each reel
+const MAX_ASTEROIDS = 10;
+const ASTEROID_SPEED = 48;        // large ones, units/s; smaller ones go faster
+const ASTEROID_SPEEDUP = 0.08;    // extra speed per reel (fraction)
+const UFO_SPAWN_CHANCE = 0.05;    // chance per second that the top hat turns up
+const UFO_SPEED = 85;             // units/s
+const UFO_FIRE_RATE = 0.55;       // hoses per second
+const HOSE_SPEED = 150;           // units/s
+const HOSE_LENGTH = 0.65;         // seconds of travel the hose trails behind its fist; all of it hurts
+const START_LIVES = 3;
+const EXTRA_LIFE_EVERY = 2000;     // points for a bonus plane; 0 turns it off
+const MUSIC_BPM = 138;
+const VOLUME = 0.5;
+const CARD_TIME = 3.2;            // seconds an intertitle stays up (any key skips it)
+const IRIS_TIME = 0.9;            // seconds for an iris-in or iris-out
+const SHAKE_TIME = 0.35;          // seconds the picture rattles after a crash
+const HIT_STOP = 0.09;            // seconds the action freezes on a crash or a hit on the top hat
+const FLASH_TIME = 0.25;          // seconds the white flash takes to fade
+// ===========================================================
+
+const DRAW_FPS = 8, FILM_FPS = 24;        // outlines boil 8 times a second; grain changes 24 times
+const INK = '#0c0c0c', PAPER = '#f1f1f1';
+const ROCK_R = [0, 15, 28, 46], ROCK_SCORE = [0, 100, 50, 20], ROCK_PACE = [0, 2.1, 1.5, 1];   // indexed by size 1..3
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const TAU = Math.PI * 2;
+const hash = (n) => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };  // repeatable 0..1
+const lerp = (a, b, k) => a + (b - a) * k;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const SELFTEST = new URLSearchParams(location.search).has('selftest');
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const wrap = (v, m) => ((v % m) + m) % m;
+
+// ---------- Window ----------
+let W = 800, H = 600, view = 1;           // W, H: world size in units; view: canvas pixels per unit
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2), s = Math.min(innerWidth, innerHeight) / VIEW_UNITS;
+  cv.width = Math.round(innerWidth * dpr); cv.height = Math.round(innerHeight * dpr);
+  W = innerWidth / s; H = innerHeight / s; view = s * dpr;
+}
+addEventListener('resize', resize); resize();
+
+// ---------- Ink: every outline goes through here ----------
+let BOIL = 0;   // index of the current drawing; reseeds the wobble so lines "boil"
+
+const ell = (cx, cy, rx, ry, rot = 0, n = 22) => Array.from({ length: n }, (_, i) => {
+  const a = i / n * TAU, x = Math.cos(a) * rx, y = Math.sin(a) * ry, c = Math.cos(rot), s = Math.sin(rot);
+  return [cx + x * c - y * s, cy + x * s + y * c];
+});
+const arc = (cx, cy, r, a0, a1, n = 8) => Array.from({ length: n + 1 }, (_, i) => { const a = lerp(a0, a1, i / n); return [cx + Math.cos(a) * r, cy + Math.sin(a) * r]; });
+const bez = (p0, p1, p2, p3, n = 14) => Array.from({ length: n + 1 }, (_, i) => {
+  const t = i / n, u = 1 - t, a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+  return [a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0], a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]];
+});
+const rect = (x, y, w, h) => [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+const cog = (cx, cy, r, a) => Array.from({ length: 16 }, (_, i) => { const R = i % 2 ? r : r * 0.66, t = a + i / 16 * TAU; return [cx + Math.cos(t) * R, cy + Math.sin(t) * R]; });
+
+// Draws a polyline the way a tired inker would: wandering path, uneven line weight.
+function ink(pts, o = {}) {
+  const { w = 3, fill = null, stroke = INK, close = false, seed = 1, j = 1.3, v = 0.35 } = o;
+  const n = pts.length, P = [];
+  for (let i = 0; i < (close ? n : n - 1); i++) {            // split long edges so straight lines wobble too
+    const a = pts[i], b = pts[(i + 1) % n], k = Math.max(1, Math.round(dist(a, b) / 22));
+    for (let q = 0; q < k; q++) P.push([lerp(a[0], b[0], q / k), lerp(a[1], b[1], q / k)]);
+  }
+  if (!close) P.push([pts[n - 1][0], pts[n - 1][1]]);
+  const s = seed * 12.9898 + BOIL * 78.233, pa = hash(s) * TAU, pb = hash(s + 1) * TAU, pc = hash(s + 2) * TAU;
+  for (let i = 0; i < P.length; i++) {
+    P[i][0] += j * (Math.sin(i * 0.9 + pa) + 0.6 * Math.sin(i * 2.3 + pb));
+    P[i][1] += j * (Math.cos(i * 0.8 + pb) + 0.6 * Math.sin(i * 2.1 + pc));
+  }
+  if (fill) {
+    ctx.beginPath(); P.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
+    ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+  }
+  if (!stroke || !w) return;
+  ctx.strokeStyle = stroke; ctx.lineCap = ctx.lineJoin = 'round';
+  for (let i = 0; i < (close ? P.length : P.length - 1); i++) {   // one stroke per segment so the weight can vary
+    const a = P[i], b = P[(i + 1) % P.length];
+    ctx.lineWidth = w * (1 + v * Math.sin(i * 0.55 + pc));
+    ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+  }
+}
+
+// White oval with a black pupil that has a wedge cut out of it. lx, ly: where it looks (-1..1).
+function pieEye(x, y, rx, ry, lx, ly, seed) {
+  ink(ell(x, y, rx, ry, 0, 14), { fill: PAPER, w: Math.min(2, rx * 0.3), close: true, seed, j: 0.5 });
+  const px = x + lx * rx * 0.32, py = y + ly * ry * 0.3, r = rx * 0.6, R = ry * 0.55;
+  ink(ell(px, py, r, R, 0, 12), { fill: INK, w: 0, close: true, seed: seed + 1, j: 0.3 });
+  ctx.fillStyle = PAPER; ctx.beginPath(); ctx.moveTo(px, py);
+  ctx.lineTo(px + r * 0.5, py - R * 1.05); ctx.lineTo(px + r * 1.05, py - R * 0.35); ctx.fill();
+}
+
+// ---------- Period lettering ----------
+// Bold caps with oversized initials and a drop shadow; italics for the small print.
+function caps(txt, x, y, size, o = {}) {
+  const max = o.max || W - 110, face = 'px Georgia, "Times New Roman", Times, serif';
+  ctx.textBaseline = 'alphabetic';
+  if (o.italic) {
+    ctx.font = 'italic ' + size + face;
+    const w = ctx.measureText(txt).width;
+    if (w > max) return caps(txt, x, y, size * max / w * 0.99, o);
+    ctx.textAlign = 'center'; ctx.fillStyle = PAPER; ctx.fillText(txt, x, y);
+    return;
+  }
+  const g = []; let w = 0, lead = true;
+  for (const ch of txt) {
+    ctx.font = 'bold ' + (lead && /\w/.test(ch) ? size : size * 0.78) + face;
+    const c = ch.toUpperCase();
+    g.push([c, ctx.font, w]); w += ctx.measureText(c).width + size * 0.1;
+    lead = ch === ' ';
+  }
+  if (w > max) return caps(txt, x, y, size * max / w * 0.99, o);
+  const x0 = o.align === 'left' ? x : o.align === 'right' ? x - w : x - w / 2;
+  ctx.textAlign = 'left';
+  g.forEach(([c, font, dx], i) => {
+    const gy = y + (hash(i * 7.3 + txt.length) - 0.5) * size * 0.05;    // hand-lettered baseline
+    ctx.font = font;
+    ctx.fillStyle = o.shadow || '#4a4a4a'; ctx.fillText(c, x0 + dx + size * 0.05, gy + size * 0.05);
+    ctx.fillStyle = PAPER; ctx.fillText(c, x0 + dx, gy);
+  });
+}
+
+// An intertitle card: double rule border, diamonds in the corners. lines: [text, size, {italic}], '~' is a rule.
+function card(lines, textA = 1, bg = '#080808') {
+  ctx.fillStyle = bg; ctx.fillRect(-20, -20, W + 40, H + 40);
+  ctx.globalAlpha = textA;
+  const m = 26;
+  ink(rect(m, m, W - 2 * m, H - 2 * m), { stroke: PAPER, w: 4, close: true, seed: 900, j: 0.8 });
+  ink(rect(m + 12, m + 12, W - 2 * m - 24, H - 2 * m - 24), { stroke: PAPER, w: 1.5, close: true, seed: 901, j: 0.8 });
+  for (const [x, y] of rect(m + 30, m + 30, W - 2 * m - 60, H - 2 * m - 60)) ink([[x, y - 8], [x + 8, y], [x, y + 8], [x - 8, y]], { fill: PAPER, w: 0, close: true, seed: 902 });
+  let y = H / 2 - lines.reduce((s, l) => s + l[1] * 1.4, 0) / 2;
+  for (const [txt, size, o] of lines) {
+    y += size * 1.4;
+    if (txt === '~') {
+      const ry = y - size * 0.7;
+      ink([[W / 2 - 120, ry], [W / 2 - 14, ry]], { stroke: PAPER, w: 1.5, seed: 903 });
+      ink([[W / 2 + 14, ry], [W / 2 + 120, ry]], { stroke: PAPER, w: 1.5, seed: 904 });
+      ink([[W / 2, ry - 6], [W / 2 + 6, ry], [W / 2, ry + 6], [W / 2 - 6, ry]], { fill: PAPER, w: 0, close: true, seed: 905 });
+    } else if (txt) caps(txt, W / 2, y - size * 0.35, size, o);
+  }
+  ctx.globalAlpha = 1;
+}
+const IT = { italic: true };
+const ORDINAL = ['First', 'Second', 'Third', 'Fourth', 'Fifth', 'Sixth', 'Seventh', 'Eighth', 'Ninth', 'Tenth'];
+const QUIPS = [
+  'In which our Aviator meets some very rude Cannonballs',
+  'In which matters grow decidedly worse',
+  'Wherein a Gentleman’s Hat takes to the air',
+  'Meanwhile, the Cannonballs multiply…',
+  'Heavens! Still more of them!',
+  'Our Hero begins to suspect foul play',
+];
+const roman = (n) => [[10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I']].reduce((s, [v, r]) => { while (n >= v) { s += r; n -= v; } return s; }, '');
+
+// ---------- Film look: drawn over every frame ----------
+const grain = document.createElement('canvas'); grain.width = grain.height = 160;
+{
+  const g = grain.getContext('2d'), im = g.createImageData(160, 160);
+  for (let i = 0; i < im.data.length; i += 4) {
+    im.data[i] = im.data[i + 1] = im.data[i + 2] = Math.random() < 0.5 ? 0 : 255; im.data[i + 3] = Math.random() * 60;
+  }
+  g.putImageData(im, 0, 0);
+}
+const grainPat = ctx.createPattern(grain, 'repeat');
+let sepia = true;
+const reduce = matchMedia('(prefers-reduced-motion: reduce)');
+let calm = reduce.matches;              // steady picture: no flicker, gate-weave, scratches or dust
+reduce.addEventListener('change', (e) => { calm = e.matches; });
+
+function filmPass(n) {                         // n: film frame number, so the dirt changes 24 times a second
+  const r = (k) => hash((calm ? 0 : n) * 1.618 + k);     // calm: the grain and the exposure hold still
+  if (sepia) {
+    ctx.globalCompositeOperation = 'multiply'; ctx.fillStyle = '#f2d9aa'; ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'lighten'; ctx.fillStyle = '#1d1309'; ctx.fillRect(0, 0, W, H);   // blacks go brown
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.save(); ctx.translate(-r(1) * 160, -r(2) * 160); ctx.fillStyle = grainPat; ctx.fillRect(0, 0, W + 160, H + 160); ctx.restore();
+  if (!calm) {
+    // scratches: one that lingers for most of a second, plus the odd single-frame one
+    ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = 1;
+    const vline = (x) => { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x + (r(7) - 0.5) * 6, H); ctx.stroke(); };
+    const linger = hash(Math.floor(n / 18) * 9.1);
+    if (linger < 0.45) vline(40 + linger / 0.45 * (W - 80) + r(3) * 2);
+    if (r(4) < 0.3) vline(r(5) * W);
+    // dust and hairs
+    ctx.fillStyle = 'rgba(0,0,0,.55)';
+    for (let i = 0; i < 3; i++) if (r(10 + i) < 0.35) { ctx.beginPath(); ctx.ellipse(r(20 + i) * W, r(30 + i) * H, 1 + r(40 + i) * 3, 1 + r(50 + i) * 2, r(60 + i) * 3, 0, TAU); ctx.fill(); }
+  }
+  // flicker
+  ctx.fillStyle = 'rgba(0,0,0,' + (0.02 + 0.09 * r(6)).toFixed(3) + ')'; ctx.fillRect(0, 0, W, H);
+  // vignette and the rounded corners of the projector gate
+  const far = Math.hypot(W, H) / 2, g = ctx.createRadialGradient(W / 2, H / 2, far * 0.5, W / 2, H / 2, far * 1.08);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,.85)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#000'; ctx.beginPath(); ctx.rect(-5, -5, W + 10, H + 10); ctx.roundRect(6, 6, W - 12, H - 12, 26); ctx.fill('evenodd');
+}
+
+// ---------- Sound (Web Audio) ----------
+let AC = null, master = null, noiseBuf = null, muted = false, nextAt = 0, nextBeat = 0;
+const hz = (m) => 440 * Math.pow(2, (m - 69) / 12);
+
+// Everything plays through a narrow band, like a gramophone horn, over a bed of surface crackle.
+function wire(ac) {
+  AC = ac;
+  master = ac.createGain(); master.gain.value = muted ? 0 : VOLUME;
+  const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 260;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3400;
+  master.connect(hp).connect(lp).connect(ac.destination);
+  const buf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = (Math.random() - 0.5) * 0.02 + (Math.random() < 0.0006 ? (Math.random() - 0.5) * 0.8 : 0);
+  const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(master); src.start();
+  noiseBuf = ac.createBuffer(1, ac.sampleRate / 2, ac.sampleRate);
+  const nd = noiseBuf.getChannelData(0); for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+}
+
+// One plucked note. `from` slides the pitch in from another note over `glide` seconds.
+function tone(type, midi, at, dur, vol, from = midi, glide = 0.1) {
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(hz(from), at);
+  if (from !== midi) o.frequency.exponentialRampToValueAtTime(hz(midi), at + glide);
+  g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol, at + 0.008); g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+  o.connect(g).connect(master); o.start(at); o.stop(at + dur + 0.02);
+}
+function noise(at, dur, vol) {
+  const s = AC.createBufferSource(), g = AC.createGain();
+  s.buffer = noiseBuf; g.gain.setValueAtTime(vol, at); g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+  s.connect(g).connect(master); s.start(at); s.stop(at + dur + 0.02);
+}
+
+// Sound effects. Each takes the audio time to play at.
+const SFX = {
+  shot:    (t) => { tone('square', 52, t, 0.1, 0.11, 88, 0.08); noise(t, 0.03, 0.1); },                    // pop-gun
+  thud:    (t) => { tone('triangle', 45, t, 0.3, 0.3, 64, 0.2); noise(t, 0.16, 0.2); },                    // cannonball cracks
+  boing:   (t) => { tone('triangle', 55, t, 0.4, 0.15, 76, 0.35); },                                       // the hat lets fly
+  whistle: (t) => { tone('sine', 96, t, 0.22, 0.07, 86, 0.2); tone('sine', 86, t + 0.22, 0.22, 0.07, 96, 0.2); },   // slide whistle while it is about
+  clang:   (t) => { [80, 87, 91].forEach((m) => tone('square', m, t, 0.5, 0.06)); noise(t, 0.2, 0.18); },   // hat is hit
+  wah:     (t) => { [58, 57, 56, 55].forEach((m, i) => tone('sawtooth', m - 1, t + i * 0.3, i === 3 ? 0.7 : 0.28, 0.11, m, 0.25)); },   // sad trombone
+  fanfare: (t) => { [72, 76, 79, 84].forEach((m, i) => tone('triangle', m, t + i * 0.1, i === 3 ? 0.4 : 0.14, 0.17)); },
+};
+const play = (name) => { if (AC && AC.state === 'running') SFX[name](AC.currentTime); };
+
+// The ragtime loop: 32 beats of oom-pah bass under a syncopated tune in F (the cartoon's is in C).
+// Chords: [bass root, bass fifth, right-hand stab]
+const CH = { F: [53, 48, [60, 65, 69]], C7: [48, 55, [58, 64, 67]], Bb: [46, 53, [62, 65, 70]], G7: [43, 50, [59, 62, 65]] };
+const PROG = ['F', 'F', 'F', 'F', 'C7', 'C7', 'C7', 'C7', 'C7', 'C7', 'C7', 'C7', 'F', 'F', 'F', 'F',
+              'F', 'F', 'F', 'F', 'Bb', 'Bb', 'Bb', 'Bb', 'G7', 'G7', 'C7', 'C7', 'F', 'F', 'C7', 'C7'];
+// Melody: [beat, length in beats, MIDI note]
+const MELODY = [
+  [0, .25, 72], [.25, .5, 77], [.75, .25, 81], [1, .5, 84], [1.5, .5, 81], [2, .25, 77], [2.25, .5, 81], [2.75, .25, 77], [3, 1, 72],
+  [4, .25, 76], [4.25, .5, 79], [4.75, .25, 82], [5, .5, 84], [5.5, .5, 82], [6, .25, 79], [6.25, .5, 82], [6.75, .25, 79], [7, 1, 76],
+  [8, .25, 84], [8.25, .5, 82], [8.75, .25, 79], [9, .5, 76], [9.5, .5, 79], [10, .25, 82], [10.25, .5, 84], [10.75, .25, 82], [11, 1, 79],
+  [12, .25, 81], [12.25, .5, 84], [12.75, .25, 81], [13, .5, 77], [13.5, .5, 81], [14, .5, 84], [14.5, .5, 89], [15, 1, 84],
+  [16, .25, 89], [16.25, .5, 84], [16.75, .25, 81], [17, .5, 84], [17.5, .5, 81], [18, .25, 77], [18.25, .5, 81], [18.75, .25, 84], [19, 1, 87],
+  [20, .25, 86], [20.25, .5, 82], [20.75, .25, 86], [21, .5, 89], [21.5, .5, 86], [22, .25, 82], [22.25, .5, 86], [22.75, .25, 82], [23, 1, 77],
+  [24, .25, 79], [24.25, .5, 83], [24.75, .25, 86], [25, .5, 83], [25.5, .5, 79], [26, .25, 76], [26.25, .5, 79], [26.75, .25, 82], [27, 1, 84],
+  [28, .25, 81], [28.25, .5, 84], [28.75, .25, 81], [29, 1, 77], [30, .25, 72], [30.25, .25, 74], [30.5, .5, 76], [31, .5, 79], [31.5, .5, 76],
+];
+function scheduleBeat(lb, at) {
+  const beat = 60 / MUSIC_BPM, [root, fifth, stab] = CH[PROG[lb]];
+  if (lb % 2 === 0) tone('square', lb % 4 === 0 || PROG[lb] !== PROG[lb - 2] ? root : fifth, at, 0.3, 0.11);   // oom
+  else stab.forEach((m) => tone('square', m, at, 0.16, 0.04));                                                // pah
+  for (const [s, d, m] of MELODY) if (Math.floor(s) === lb) tone('triangle', m, at + (s - lb) * beat, d * beat * 0.95, 0.13);
+}
+function music() {                             // called every frame; schedules a little ahead on the audio clock
+  if (!AC || AC.state !== 'running') return;
+  if (nextAt < AC.currentTime - 0.1) nextAt = AC.currentTime + 0.05;   // never play catch-up after a stall
+  while (nextAt < AC.currentTime + 0.3) { scheduleBeat(nextBeat++ % PROG.length, nextAt); nextAt += 60 / MUSIC_BPM; }
+}
+function initAudio() {                         // browsers only allow sound after a key press
+  if (AC) { if (AC.state === 'suspended' && !paused) AC.resume(); return; }   // a gamepad press cannot unlock sound; the next key or tap does
+  try { wire(new (window.AudioContext || window.webkitAudioContext)()); AC.resume(); } catch (err) { AC = null; }   // no audio: play silent
+}
+function syncAudio() { if (AC) (paused || document.hidden) ? AC.suspend() : AC.resume(); }
+
+// ---------- Game state ----------
+let scene = 'title', sceneT = 0;               // title | card | play | end; sceneT: seconds in this scene
+let level = 1, score = 0, lives = START_LIVES, cleared = false, nextLife = EXTRA_LIFE_EVERY;
+let ship = { x: W / 2, y: H / 2, a: 0, alive: false }, rocks = [], shots = [], hoses = [], puffs = [], ufo = null;
+let iris = 1, irisGoal = 1, irisThen = null;   // 0 = closed, 1 = fully open
+let paused = false, clock = 0;                 // clock: seconds of un-paused time
+let shake = 0;                                 // seconds of crash shake left
+let stop = 0, flash = 0;                       // seconds of hit-stop and of flash left
+const keys = {};
+
+function mkRock(x, y, size, ang = Math.random() * TAU) {
+  const sp = ASTEROID_SPEED * (1 + (level - 1) * ASTEROID_SPEEDUP) * ROCK_PACE[size] * (0.7 + Math.random() * 0.6);
+  return { x, y, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, size, r: ROCK_R[size], seed: Math.random() * 1000, t: Math.random() * 10 };
+}
+function startGame() { level = 1; score = 0; lives = START_LIVES; nextLife = EXTRA_LIFE_EVERY; record = false; showCard(); }
+
+// The record is kept in the browser. If storage is blocked it simply lasts for this visit.
+const BEST_KEY = 'rubber-hose-revue.best';
+let store = null, best = 0, record = false;
+try { if (!SELFTEST) { store = localStorage; best = Number(store.getItem(BEST_KEY)) || 0; } } catch (err) { store = null; }   // a test run must not touch the real record
+function saveBest() {
+  if (score <= best) return;
+  best = score; record = true;
+  try { store.setItem(BEST_KEY, String(best)); } catch (err) { /* no storage: nothing to do */ }
+}
+function addScore(n) {
+  score += n;
+  while (EXTRA_LIFE_EVERY > 0 && score >= nextLife) {      // every threshold crossed earns a plane
+    nextLife += EXTRA_LIFE_EVERY; lives++;
+    puffs.push({ x: ship.x, y: ship.y - 40, vx: 0, vy: -24, life: 1.4, max: 1.4, txt: 'Bonus plane!' });
+    play('fanfare');
+  }
+}
+function showCard() { scene = 'card'; sceneT = 0; iris = irisGoal = 1; }
+function beginLevel() {
+  ship = { x: W / 2, y: H / 2, vx: 0, vy: 0, a: -Math.PI / 2, cool: 0, safe: 2.5, alive: true, respawn: 0, prop: 0 };
+  rocks = []; shots = []; hoses = []; puffs = []; ufo = null; cleared = false;
+  const n = Math.min(MAX_ASTEROIDS, START_ASTEROIDS + (level - 1) * ASTEROIDS_PER_LEVEL);
+  for (let i = 0; i < n; i++) {
+    let x, y;
+    do { x = Math.random() * W; y = Math.random() * H; } while (Math.hypot(x - ship.x, y - ship.y) < 190);   // not on top of the ship
+    rocks.push(mkRock(x, y, 3));
+  }
+  scene = 'play'; sceneT = 0; iris = 0; irisGoal = 1;        // iris-in
+}
+function irisTo(goal, then) { irisGoal = goal; irisThen = then || null; }
+
+function burst(x, y, r, txt) {
+  for (let i = 0; i < 7; i++) {
+    const a = Math.random() * TAU, v = 30 + Math.random() * 70;
+    puffs.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, r: r * (0.25 + Math.random() * 0.3), life: 0.6, max: 0.6, seed: Math.random() * 999 });
+  }
+  puffs.push({ x, y: y - r, vx: 0, vy: -30, life: 0.8, max: 0.8, txt });
+}
+
+// Large splits into two medium, medium into two small, small just pops.
+function hitRock(k) {
+  rocks.splice(rocks.indexOf(k), 1);
+  addScore(ROCK_SCORE[k.size]);
+  if (k.size > 1) {
+    const a = Math.random() * TAU;
+    for (const ang of [a, a + Math.PI * (0.6 + Math.random() * 0.8)]) rocks.push(mkRock(k.x + Math.cos(ang) * k.r * 0.4, k.y + Math.sin(ang) * k.r * 0.4, k.size - 1, ang));
+  }
+  burst(k.x, k.y, k.r, k.size === 3 ? 'Boom!' : k.size === 2 ? 'Biff!' : 'Pop!');
+  play('thud');
+}
+function killShip() {
+  if (!ship.alive) return;
+  ship.alive = false; ship.respawn = 1.6; lives--; shake = SHAKE_TIME; stop = HIT_STOP; flash = FLASH_TIME; rumble();
+  burst(ship.x, ship.y, 26, 'Crash!'); play('wah');
+}
+function spawnUfo() {
+  const dir = Math.random() < 0.5 ? 1 : -1, y = H * (0.15 + Math.random() * 0.7);
+  ufo = { x: dir > 0 ? -45 : W + 45, y, y0: y, dir, t: 0, cool: 0.9, whistle: 0 };
+}
+// A hose shot snakes along its heading: straight-line travel plus a sideways sine.
+const hosePos = (h, t) => {
+  const d = HOSE_SPEED * t, w = Math.sin(t * 9) * 16;
+  return [h.x + Math.cos(h.a) * d - Math.sin(h.a) * w, h.y + Math.sin(h.a) * d + Math.cos(h.a) * w];
+};
+const hosePts = (h) => {                                   // fist first, then back along the trail
+  const pts = [];
+  for (let k = 0; k < 14; k++) { const t = h.t - k * HOSE_LENGTH / 13; if (t >= 0) pts.push(hosePos(h, t)); }
+  return pts;
+};
+// Distance on a world that wraps at the edges
+const wdist = (a, b) => { const dx = Math.abs(a.x - b.x), dy = Math.abs(a.y - b.y); return Math.hypot(Math.min(dx, W - dx), Math.min(dy, H - dy)); };
+
+// ---------- Simulation ----------
+function update(dt) {
+  const s = ship;
+  if (s.alive) {
+    if (keys.ArrowLeft) s.a -= SHIP_ROTATION_RATE * dt;
+    if (keys.ArrowRight) s.a += SHIP_ROTATION_RATE * dt;
+    const c = Math.cos(s.a), sn = Math.sin(s.a);
+    if (keys.ArrowUp) {
+      s.vx += c * SHIP_THRUST * dt; s.vy += sn * SHIP_THRUST * dt;
+      if (Math.random() < dt * 16) puffs.push({ x: s.x - c * 24, y: s.y - sn * 24, vx: -c * 40, vy: -sn * 40, r: 5, life: 0.45, max: 0.45, seed: Math.random() * 999 });
+    }
+    const drag = Math.pow(1 - SHIP_FRICTION, dt); s.vx *= drag; s.vy *= drag;
+    const sp = Math.hypot(s.vx, s.vy); if (sp > SHIP_MAX_SPEED) { s.vx *= SHIP_MAX_SPEED / sp; s.vy *= SHIP_MAX_SPEED / sp; }
+    s.x = wrap(s.x + s.vx * dt, W); s.y = wrap(s.y + s.vy * dt, H);
+    s.prop += dt * (keys.ArrowUp ? 40 : 14); s.safe -= dt; s.cool -= dt;
+    if (keys.Space && s.cool <= 0 && !cleared) {
+      s.cool = 1 / FIRE_RATE;
+      shots.push({ x: s.x + c * 24, y: s.y + sn * 24, vx: c * BULLET_SPEED + s.vx, vy: sn * BULLET_SPEED + s.vy, life: BULLET_LIFE });
+      play('shot');
+    }
+  } else if ((s.respawn -= dt) <= 0) {
+    if (lives > 0) Object.assign(s, { x: W / 2, y: H / 2, vx: 0, vy: 0, a: -Math.PI / 2, alive: true, safe: 2.5 });
+    else if (irisGoal === 1) irisTo(0, () => { saveBest(); scene = 'end'; sceneT = 0; });        // iris-out on the wreck, then THE END
+  }
+
+  for (const k of rocks) { k.x = wrap(k.x + k.vx * dt, W); k.y = wrap(k.y + k.vy * dt, H); k.t += dt; }
+  for (const b of shots) { b.x = wrap(b.x + b.vx * dt, W); b.y = wrap(b.y + b.vy * dt, H); b.life -= dt; }
+  shots = shots.filter((b) => b.life > 0);
+  for (const h of hoses) h.t += dt;
+  hoses = hoses.filter((h) => h.t < 9 && hosePts(h).some(([x, y]) => x > -60 && x < W + 60 && y > -60 && y < H + 60));   // gone once the tail has left too
+  for (const p of puffs) { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+  puffs = puffs.filter((p) => p.life > 0);
+
+  if (ufo) {
+    const u = ufo;
+    u.t += dt; u.x += u.dir * UFO_SPEED * dt; u.y = u.y0 + Math.sin(u.t * 1.7) * 40;
+    if (Math.random() < dt * 5) puffs.push({ x: u.x + 10, y: u.y - 42, vx: -u.dir * 20, vy: -24, r: 4, life: 0.6, max: 0.6, seed: Math.random() * 999 });
+    if ((u.whistle -= dt) <= 0) { u.whistle = 0.7; play('whistle'); }
+    if ((u.cool -= dt) <= 0 && s.alive) {
+      u.cool = 1 / UFO_FIRE_RATE;
+      hoses.push({ x: u.x, y: u.y + 14, a: Math.atan2(s.y - u.y, s.x - u.x) + (Math.random() - 0.5) * 0.5, t: 0 });
+      play('boing');
+    }
+    if (u.x < -60 || u.x > W + 60) ufo = null;               // crossed the screen and left
+  }
+
+  for (const b of [...shots]) {
+    const k = rocks.find((r) => wdist(b, r) < r.r + 3);
+    if (k) { shots.splice(shots.indexOf(b), 1); hitRock(k); }
+    else if (ufo && Math.hypot(b.x - ufo.x, b.y - ufo.y + 8) < 30) {
+      shots.splice(shots.indexOf(b), 1); addScore(200);
+      burst(ufo.x, ufo.y, 30, 'Clang!'); play('clang'); ufo = null; stop = HIT_STOP; flash = FLASH_TIME;
+    }
+  }
+  if (s.alive && s.safe <= 0 && (
+    rocks.some((r) => wdist(s, r) < r.r + 11) ||
+    (ufo && Math.hypot(s.x - ufo.x, s.y - ufo.y) < 38) ||
+    hoses.some((h) => hosePts(h).some(([x, y], i) => Math.hypot(x - s.x, y - s.y) < (i ? 13 : 17))))) killShip();
+
+  if (rocks.length) { if (!ufo && sceneT > 6 && Math.random() < UFO_SPAWN_CHANCE * dt) spawnUfo(); }
+  else if (!ufo && !cleared && s.alive) {                    // field is clear: iris-out, then the next intertitle
+    cleared = true; s.safe = 9; hoses = [];
+    play('fanfare');
+    irisTo(0, () => { level++; showCard(); });
+  }
+}
+
+function step(dt) {
+  // hit-stop: the clock stands still for a beat, as when Phaser's Clock runs at a timeScale of 0. The flash holds with it.
+  if (stop > 0) { stop -= dt; return; }
+  clock += dt; sceneT += dt; shake -= dt; flash -= dt;
+  if (iris !== irisGoal) {
+    iris = irisGoal > iris ? Math.min(irisGoal, iris + dt / IRIS_TIME) : Math.max(irisGoal, iris - dt / IRIS_TIME);
+    if (iris === irisGoal && irisThen) { const f = irisThen; irisThen = null; f(); }
+  }
+  if (scene === 'card' && sceneT > CARD_TIME) beginLevel();
+  if (scene === 'play') update(dt);
+}
+
+// ---------- Drawing ----------
+// Calls fn at (x, y) and again at the far edge when the thing overlaps a border, so wrapping is seamless.
+function around(x, y, r, fn) {
+  for (const ox of [0, x < r ? W : x > W - r ? -W : null]) for (const oy of [0, y < r ? H : y > H - r ? -H : null]) if (ox !== null && oy !== null) fn(x + ox, y + oy);
+}
+
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#3d3d3d'); g.addColorStop(1, '#7a7a7a');
+  ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
+  for (let i = 0; i < 4; i++) {                              // slow clouds
+    const x = (hash(i * 7.7) * (W + 300) + clock * (5 + i * 2)) % (W + 300) - 150, y = 60 + hash(i * 2.3) * (H - 120);
+    for (const [dx, dy, rx, ry] of [[-44, 6, 46, 20], [0, -8, 56, 28], [48, 8, 42, 18]]) ink(ell(x + dx, y + dy, rx, ry, 0, 14), { fill: 'rgba(255,255,255,.09)', w: 0, close: true, seed: 400 + i });
+  }
+  for (let i = 0; i < 22; i++) {                             // stars that twinkle with the boil
+    const x = hash(i * 3.1) * W, y = hash(i * 5.7) * H, r = 2.5 + 3.5 * hash(i + BOIL * 0.37);
+    ink([[x - r, y], [x + r, y]], { w: 1.4, stroke: '#d8d8d8', seed: i }); ink([[x, y - r], [x, y + r]], { w: 1.4, stroke: '#d8d8d8', seed: i + 50 });
+  }
+}
+
+// The biplane, seen from above, nose along +x.
+function drawShip() {
+  const s = ship;
+  if (!s.alive || (s.safe > 0 && !cleared && Math.floor(clock * 12) % 2)) return;   // blinks while it cannot be hurt
+  around(s.x, s.y, 38, (x, y) => {
+    ctx.save(); ctx.translate(x, y); ctx.rotate(s.a);
+    const o = { close: true, j: 0.6 };
+    ink(ell(-20, 0, 4.5, 11, 0, 12), { ...o, fill: PAPER, w: 2, seed: 201 });                          // tailplane
+    ink(ell(-2, 0, 21, 5.5, 0, 16), { ...o, fill: '#e2e2e2', w: 2, seed: 202 });                       // fuselage
+    ink(ell(5, 0, 7, 24, 0, 18), { ...o, fill: PAPER, w: 2.2, seed: 203 });                            // wings
+    for (const k of [-1, 1]) ink(ell(5, k * 15, 3.4, 3.4, 0, 8), { close: true, w: 1.6, seed: 204 + k, j: 0.3 });   // roundels
+    const fl = Math.sin(clock * 16) * 5;                                                               // scarf streams out behind
+    for (const [c, w] of [[INK, 6], [PAPER, 3]]) ink(bez([-7, 0], [-16, fl], [-25, -fl], [-37, fl * 1.4], 8), { stroke: c, w, seed: 200, j: 0.4, v: 0.1 });
+    ink(ell(-5, 0, 4.4, 4.4, 0, 10), { fill: INK, w: 1, close: true, seed: 206, j: 0.3 });             // pilot's helmet
+    ink(ell(15, 0, 4, 5.5, 0, 10), { fill: '#555', w: 1.6, close: true, seed: 207, j: 0.3 });          // cowling
+    const L = 3 + 10 * Math.abs(Math.cos(s.prop));                                                    // propeller seen edge-on
+    ink([[21, -L], [21, L]], { w: 2.6, seed: 208, j: 0.3 });
+    ctx.restore();
+  });
+}
+
+// A cannonball with a face. Big ones scowl; smaller ones are having second thoughts.
+function drawRock(k) {
+  around(k.x, k.y, k.r + 8, (x, y) => {
+    const R = k.r, tilt = Math.sin(k.t * 1.3) * 0.3;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(tilt);
+    ink(ell(0, 0, R, R, 0, 12 + k.size * 5), { fill: '#151515', w: 3, close: true, seed: k.seed });
+    ink(arc(0, 0, R * 0.8, 3.4, 4.5, 6), { stroke: '#bdbdbd', w: R * 0.08 + 1, seed: k.seed + 1 });   // shine
+    const la = Math.atan2(ship.y - y, ship.x - x) - tilt, lx = Math.cos(la), ly = Math.sin(la);       // eyes follow the plane
+    const b = k.size === 3 ? 1 : -1;
+    for (const s of [-1, 1]) {
+      pieEye(s * R * 0.3, -R * 0.12, R * 0.19, R * 0.28, lx, ly, k.seed + 3 + s);
+      ink([[s * R * 0.12, -R * (0.44 - 0.1 * b)], [s * R * 0.5, -R * (0.44 + 0.1 * b)]], { stroke: PAPER, w: R * 0.05 + 1, seed: k.seed + 6 + s, j: 0.5 });   // brow
+    }
+    if (k.size === 3) {                                       // toothy grimace
+      const m = [...bez([-R * 0.42, R * 0.32], [-R * 0.2, R * 0.42], [R * 0.2, R * 0.42], [R * 0.42, R * 0.32], 6),
+                 ...bez([R * 0.42, R * 0.32], [R * 0.22, R * 0.66], [-R * 0.22, R * 0.66], [-R * 0.42, R * 0.32], 6)];
+      ink(m, { fill: PAPER, w: 0, close: true, seed: k.seed + 9, j: 0.6 });
+      for (let i = -2; i <= 2; i++) ink([[i * R * 0.13, R * 0.36], [i * R * 0.13, R * 0.56]], { w: 1.5, seed: k.seed + 10 + i, j: 0.4 });
+    } else ink(ell(0, R * 0.45, R * (k.size === 2 ? 0.16 : 0.2), R * (k.size === 2 ? 0.14 : 0.26), 0, 10), { fill: PAPER, w: 0, close: true, seed: k.seed + 9, j: 0.4 });   // "oh!" or a scream
+    ctx.restore();
+  });
+}
+
+// The mechanical top hat: riveted band, cogs on the brim, stovepipe, aerial on a spring.
+function drawUfo() {
+  const u = ufo;
+  if (!u) return;
+  ctx.save(); ctx.translate(u.x, u.y); ctx.rotate(Math.sin(u.t * 3) * 0.12);
+  ink(ell(0, 13, 26, 9, 0, 16), { fill: '#8c8c8c', w: 2.5, close: true, seed: 300 });                 // saucer belly
+  for (let i = -1; i <= 1; i++) ink(ell(i * 13, 17, 3, 3, 0, 8), { fill: Math.floor(u.t * 6 + i + 9) % 2 ? PAPER : INK, w: 1, close: true, seed: 301 + i, j: 0.3 });   // lamps
+  for (const s of [-1, 1]) ink(cog(s * 34, 8, 9, u.t * 4 * s), { fill: '#bdbdbd', w: 2, close: true, seed: 303 + s, j: 0.4 });   // cogs turn opposite ways
+  ink(ell(0, 8, 37, 8, 0, 20), { fill: '#262626', w: 2.5, close: true, seed: 305 });                  // brim
+  ink([[-17, 8], [-19, -28], [19, -28], [17, 8]], { fill: '#1b1b1b', w: 2.5, close: true, seed: 306 });   // crown
+  ink([[-17.6, 2], [-18.2, -8], [18.2, -8], [17.6, 2]], { fill: PAPER, w: 1.5, close: true, seed: 307, j: 0.5 });   // hat band,
+  ctx.fillStyle = INK; for (let i = -2; i <= 2; i++) { ctx.beginPath(); ctx.arc(i * 7, -3, 1.5, 0, TAU); ctx.fill(); }   // riveted on
+  ink(ell(0, -28, 19, 4.5, 0, 14), { fill: '#444', w: 2, close: true, seed: 308, j: 0.6 });           // lid
+  ink(rect(7, -41, 7, 12), { fill: '#666', w: 2, close: true, seed: 312, j: 0.5 });                   // stovepipe
+  const sp = Math.sin(u.t * 9) * 3;
+  ink([[-9, -30], [-13, -34], [-5, -38], [-13, -42], [-9, -46 + sp]], { w: 1.5, seed: 313, j: 0.4 });   // spring
+  ink(ell(-9, -49 + sp, 3.5, 3.5, 0, 8), { fill: PAPER, w: 1.5, close: true, seed: 314, j: 0.3 });
+  ctx.restore();
+}
+
+function drawHose(h) {                                       // a wiggling rubber arm with a gloved fist on the end
+  const pts = hosePts(h);
+  if (pts.length > 1) for (const [c, w] of [[INK, 8.5], [PAPER, 4.5]]) ink(pts, { stroke: c, w, seed: 500, j: 0.5, v: 0.1 });
+  ink(ell(pts[0][0], pts[0][1], 7, 6.5, 0, 10), { fill: PAPER, w: 2.2, close: true, seed: 501, j: 0.5 });
+}
+
+function drawPuff(p) {
+  const k = p.life / p.max;                                  // 1 when new, 0 when gone
+  ctx.globalAlpha = clamp(k * 1.5, 0, 1);
+  if (p.txt) caps(p.txt, p.x, p.y, 24 * (1.5 - 0.5 * k), { shadow: INK, max: 400 });
+  else ink(ell(p.x, p.y, p.r * (1.7 - k), p.r * (1.7 - k), 0, 10), { fill: PAPER, w: 2, close: true, seed: p.seed, j: 0.8 });
+  ctx.globalAlpha = 1;
+}
+
+function drawHud() {                                         // score, reel and lives as a strip of intertitle lettering
+  const o = { shadow: INK, max: W / 3 - 30 };
+  caps('Score · ' + score, 26, 40, 20, { ...o, align: 'left' });
+  caps('Reel ' + roman(level), W / 2, 40, 20, o);
+  caps('Lives · ' + lives, W - 26, 40, 20, { ...o, align: 'right' });
+  ink([[24, 52], [W - 24, 52]], { stroke: PAPER, w: 1.2, seed: 600, j: 0.7 });
+}
+
+function drawIris() {                                        // black mask with a round hole centred on the plane
+  if (iris >= 1) return;
+  const cx = ship.x, cy = ship.y, e = iris * iris * (3 - 2 * iris);
+  const R = Math.hypot(Math.max(cx, W - cx), Math.max(cy, H - cy)) * e;
+  ctx.fillStyle = '#050505'; ctx.beginPath(); ctx.rect(-20, -20, W + 40, H + 40); ctx.arc(cx, cy, R, 0, TAU, true); ctx.fill('evenodd');
+  if (R > 3) ink(ell(cx, cy, R, R, 0, 40), { w: 6, close: true, seed: 950, j: 1.5 });
+}
+
+function draw(now) {
+  const film = Math.floor(now / 1000 * FILM_FPS), fade = clamp(sceneT / 0.5, 0, 1);
+  BOIL = Math.floor(clock * DRAW_FPS);
+  ctx.setTransform(view, 0, 0, view, 0, 0);
+  // gate weave: the whole picture wanders a pixel or two in the projector
+  if (!calm) ctx.translate(Math.sin(film * 0.31) * 1.1 + (hash(film) - 0.5), Math.sin(film * 0.17) * 1.4 + (hash(film + 0.5) < 0.04 ? 3 : 0));
+  // a crash rattles the picture: a random offset every frame that dies away, after Phaser's camera shake effect
+  if (!calm && !paused && shake > 0) ctx.translate((Math.random() - 0.5) * 14 * shake / SHAKE_TIME, (Math.random() - 0.5) * 14 * shake / SHAKE_TIME);
+  if (scene === 'play') {
+    drawSky();
+    rocks.forEach(drawRock);
+    for (const b of shots) ink(ell(b.x, b.y, 4, 4, 0, 8), { fill: PAPER, w: 2, close: true, seed: 700, j: 0.4 });
+    hoses.forEach(drawHose);
+    drawUfo(); drawShip();
+    puffs.forEach(drawPuff);
+    drawHud(); drawIris();
+  } else if (scene === 'title') {
+    card([['The Rubber Hose Revue presents', 20, IT], ['Cannonball', 78], ['Capers', 78], ['~', 30],
+          ['A thrilling aerial photoplay in several reels', 22, IT], ['', 10],
+          [Math.floor(clock * 1.6) % 2 ? '' : 'Press any key or tap to begin', 24],
+          ['Arrows steer and thrust  ·  Space fires  ·  P pauses  ·  M mutes', 15, IT],
+          ['Gamepad: stick steers and thrusts  ·  A fires  ·  Start pauses', 15, IT],
+          ['S toggles sepia  ·  F steadies the picture' + (best ? '  ·  The record stands at ' + best : ''), 15, IT]]);
+  } else if (scene === 'card') {
+    card([[level <= 10 ? 'Reel the ' + ORDINAL[level - 1] : 'Reel No. ' + level, 60], ['~', 34], [QUIPS[(level - 1) % QUIPS.length], 25, IT]], fade);
+  } else {
+    card([['The End', 112], ['~', 34], ['Final score · ' + score, 28], ...(record ? [['A new record!', 22]] : []),
+          ['Reached reel ' + roman(level) + (!record && best ? '  ·  The record stands at ' + best : ''), 20, IT],
+          ['', 10], ['Press any key or tap to fly again', 20, IT]], fade);
+  }
+  // a white fill over the whole picture that fades in a straight line, after Phaser's camera flash effect
+  if (!calm && flash > 0) { ctx.globalAlpha = 0.8 * flash / FLASH_TIME; ctx.fillStyle = PAPER; ctx.fillRect(-20, -20, W + 40, H + 40); ctx.globalAlpha = 1; }
+  if (paused) card([['Intermission', 64], ['~', 30], ['Press P or tap to resume the picture', 22, IT]], 1, 'rgba(0,0,0,.66)');
+  ctx.setTransform(view, 0, 0, view, 0, 0);
+  filmPass(film);
+}
+
+// ---------- Main loop and input ----------
+let last = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, 0.05);            // clamped so a stalled tab or a resume never teleports things
+  last = now;
+  pollPads(pads());
+  if (!paused) step(dt);
+  music();
+  draw(now);
+}
+
+function setPaused(p) { paused = p; syncAudio(); }
+const GAME_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space']);
+// Everything a key does, for the keyboard and for the touch buttons. 'Tap' is a touch or click on the picture.
+function press(code) {
+  initAudio();
+  keys[code] = true;
+  if (code === 'KeyM') { muted = !muted; if (master) master.gain.value = muted ? 0 : VOLUME; }
+  else if (code === 'KeyS') sepia = !sepia;
+  else if (code === 'KeyF') calm = !calm;
+  else if (code === 'KeyP') { if (scene === 'play') setPaused(!paused); }
+  else if (paused) { if (code === 'Tap') setPaused(false); }
+  else if (scene === 'title') startGame();
+  else if (scene === 'card' && sceneT > 0.5) beginLevel();
+  else if (scene === 'end' && sceneT > 1) startGame();
+}
+const release = (code) => { keys[code] = false; };
+addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (GAME_KEYS.has(e.code)) e.preventDefault();             // no page scrolling
+  if (!e.repeat) press(e.code);
+});
+addEventListener('keyup', (e) => release(e.code));
+
+// Gamepad. The button numbers of the standard layout and the rule that a button counts once it is pushed
+// past halfway follow Phaser's Gamepad class. Only changes are passed on, as with fingers below, because
+// press() also toggles the pause and starts the game.
+const padHeld = {};
+function pollPads(pads) {
+  const want = {};
+  for (const p of pads) {
+    if (!p || p.mapping !== 'standard') continue;            // other layouts number their buttons differently
+    const b = (i) => !!p.buttons[i] && p.buttons[i].value >= 0.5, x = p.axes[0] || 0, y = p.axes[1] || 0;
+    if (b(14) || x <= -0.5) want.ArrowLeft = true;
+    if (b(15) || x >= 0.5) want.ArrowRight = true;
+    if (b(12) || y <= -0.5) want.ArrowUp = true;
+    if (b(0)) want.Space = true;
+    if (b(9)) want.KeyP = true;
+  }
+  for (const code of ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'Space', 'KeyP']) {
+    if (!!want[code] === !!padHeld[code]) continue;
+    padHeld[code] = !!want[code];
+    if (want[code]) press(code); else release(code);
+  }
+}
+function pads() { try { return [...navigator.getGamepads()]; } catch (err) { return []; } }   // missing or blocked: no gamepad
+// A crash rumbles every pad that has a motor. This is the browser's own Gamepad API; a pad or browser without it stays still.
+function rumble(ps = pads()) {
+  for (const p of ps) {
+    try { Promise.resolve(p.vibrationActuator.playEffect('dual-rumble', { duration: 220, strongMagnitude: 0.8, weakMagnitude: 0.5 })).catch(() => {}); }
+    catch (err) { /* no pad in this slot, or no motor in it */ }
+  }
+}
+
+// Touch: each finger holds whichever button is under it, so a thumb can slide from one to the next.
+const pad = document.getElementById('pad'), fingers = new Map();   // pointerId -> button code, or null between buttons
+const codeAt = (e) => { const el = document.elementFromPoint(e.clientX, e.clientY); return (el && el.dataset && el.dataset.code) || null; };
+function finger(id, code) {
+  const was = fingers.get(id);
+  if (was === code) return;
+  if (was) release(was);
+  fingers.set(id, code);
+  if (code) press(code);
+  for (const b of pad.children) b.classList.toggle('on', [...fingers.values()].includes(b.dataset.code));
+}
+function liftFinger(id) { if (fingers.has(id)) { finger(id, null); fingers.delete(id); } }
+addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'touch') document.body.classList.add('touch');
+  const code = codeAt(e);
+  if (code) finger(e.pointerId, code); else { press('Tap'); release('Tap'); }
+});
+addEventListener('pointermove', (e) => { if (fingers.has(e.pointerId)) finger(e.pointerId, codeAt(e)); });
+for (const ev of ['pointerup', 'pointercancel']) addEventListener(ev, (e) => { initAudio(); liftFinger(e.pointerId); });   // iOS unlocks sound on release
+addEventListener('blur', () => { for (const id of [...fingers.keys()]) liftFinger(id); for (const k in keys) keys[k] = false; if (scene === 'play') setPaused(true); });
+document.addEventListener('visibilitychange', syncAudio);
+
+// ---------- Self-check (?selftest) ----------
+async function selfTest() {
+  const ok = (c, m) => { if (!c) throw new Error(m); };
+  let n = 0;
+  const run = (secs, until) => {                             // steps and draws at 30 fps until the condition holds
+    for (let i = 0; i < secs * 30; i++) { step(1 / 30); draw(n++ * 33); if (until && until()) return true; }
+    return !until;
+  };
+  try {
+    draw(0);                                                 // title card
+    startGame(); ok(scene === 'card', 'no intertitle before reel one');
+    ok(run(6, () => scene === 'play' && iris === 1), 'the intertitle never gives way to play');
+    ok(rocks.length === START_ASTEROIDS && rocks.every((r) => r.size === 3), 'wrong opening asteroids');
+
+    rocks = [mkRock(100, 100, 3)]; hitRock(rocks[0]);
+    ok(rocks.length === 2 && rocks.every((r) => r.size === 2), 'large must split into two medium');
+    hitRock(rocks[0]);
+    ok(rocks.length === 3 && rocks.filter((r) => r.size === 1).length === 2, 'medium must split into two small');
+    hitRock(rocks.find((r) => r.size === 1));
+    ok(rocks.length === 2, 'small must not split');
+    ok(score === 20 + 50 + 100, 'score is ' + score);
+
+    ship.safe = 99; spawnUfo(); ufo.cool = 0; run(0.1);
+    ok(hoses.length === 1, 'the top hat did not fire');
+    const p0 = hosePos(hoses[0], 0), p1 = hosePos(hoses[0], 0.17), p2 = hosePos(hoses[0], 0.52);
+    ok(dist(p0, p1) > 20 && Math.abs((p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])) > 100, 'the hose shot does not wave');
+
+    rocks = [mkRock(60, 60, 3), mkRock(90, 90, 3)];          // too much rock for this burst of fire to clear the field early
+    const a0 = ship.a; keys.ArrowUp = keys.ArrowLeft = keys.Space = true; run(0.5);
+    ok(ship.a < a0 && Math.hypot(ship.vx, ship.vy) > 20 && shots.length >= 2, 'rotate, thrust or fire did not respond');
+    keys.Space = false; run(3);
+    ok(Math.hypot(ship.vx, ship.vy) <= SHIP_MAX_SPEED + 1e-6, 'ship exceeds its top speed');
+    keys.ArrowUp = keys.ArrowLeft = false;
+    setPaused(true); draw(0); setPaused(false);
+
+    rocks = []; ufo = null; hoses = []; ship.safe = 0;
+    ok(run(8, () => scene === 'card' && level === 2), 'clearing the field must lead to the reel two card');
+    ok(run(6, () => scene === 'play'), 'reel two never starts');
+    ok(iris < 1, 'reel two must open with an iris-in');
+    ok(rocks.length === START_ASTEROIDS + ASTEROIDS_PER_LEVEL, 'reel two has the wrong asteroid count');
+
+    lives = 1; ship.safe = 0; killShip();
+    ok(lives === 0 && run(8, () => scene === 'end'), 'losing the last life must reach THE END');
+    draw(0);
+    ok(best === score && best >= 170 && record, 'the record was not taken at THE END');
+    let saved = null; store = { setItem: (k, v) => { saved = k + '=' + v; } };
+    score = best + 5; saveBest(); ok(saved === BEST_KEY + '=' + score, 'the record is not written to storage');
+    store = null; score = best + 5; saveBest(); ok(best === score, 'a missing store must not stop the record');   // setItem on null throws, and is caught
+    sceneT = 2; startGame(); ok(score === 0 && lives === START_LIVES && level === 1 && !record, 'restart does not reset the game');
+
+    beginLevel(); rocks = [mkRock(50, 50, 3)];
+    addScore(EXTRA_LIFE_EVERY - 10); ok(lives === START_LIVES, 'bonus plane came early');
+    addScore(10); ok(lives === START_LIVES + 1, 'no bonus plane at the threshold');
+    addScore(2 * EXTRA_LIFE_EVERY); ok(lives === START_LIVES + 3, 'crossing two thresholds at once must give two planes');
+
+    hoses = [{ x: 300, y: 300, a: 0, t: 0.62 }];              // the body of the hose must hurt, not only the fist
+    const body = hosePts(hoses[0]); ok(body.length === 13 && dist(body[0], body[12]) > 70, 'the hose is too short');
+    ship.x = body[8][0]; ship.y = body[8][1] + 4; ship.safe = 0; update(0);
+    ok(!ship.alive, 'flying into the hose body must wreck the plane');
+
+    // touch: the buttons go through the same press() and release() as the keyboard
+    document.body.classList.add('touch');                    // the buttons are hidden until a touch screen is seen
+    const at = (code) => { const r = pad.querySelector('[data-code=' + code + ']').getBoundingClientRect(); return { pointerId: 7, pointerType: 'touch', clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, bubbles: true }; };
+    dispatchEvent(new PointerEvent('pointerdown', at('ArrowLeft')));
+    ok(keys.ArrowLeft === true, 'touching a button must hold its key');
+    dispatchEvent(new PointerEvent('pointermove', at('ArrowRight')));
+    ok(!keys.ArrowLeft && keys.ArrowRight === true, 'sliding to the next button must swap keys');
+    dispatchEvent(new PointerEvent('pointerup', at('ArrowRight')));
+    ok(!keys.ArrowRight && !fingers.size, 'lifting the finger must release the key');
+    dispatchEvent(new PointerEvent('pointerdown', at('ArrowLeft')));                // two fingers: hold a turn while firing
+    dispatchEvent(new PointerEvent('pointerdown', { ...at('Space'), pointerId: 8 }));
+    ok(keys.ArrowLeft && keys.Space, 'two fingers must hold two keys');
+    dispatchEvent(new PointerEvent('pointerup', at('ArrowLeft')));
+    ok(!keys.ArrowLeft && keys.Space, 'lifting one finger must not release the other');
+    dispatchEvent(new PointerEvent('pointercancel', { ...at('Space'), pointerId: 8 }));
+    ok(!keys.Space && !fingers.size, 'a cancelled touch must release its key');
+    const wasCalm = calm; press('KeyF'); ok(calm === !wasCalm && scene === 'play', 'F must toggle the steady picture and nothing else'); calm = wasCalm;
+    // gamepad: a fake pad in the standard layout goes through the same press() and release()
+    const fakePad = (held, x = 0, y = 0) => [null, { mapping: 'standard', axes: [x, y], buttons: Array.from({ length: 17 }, (_, i) => ({ value: held.includes(i) ? 1 : 0 })) }];
+    pollPads(fakePad([14, 0])); ok(keys.ArrowLeft && keys.Space && !keys.ArrowUp, 'd-pad left and A must turn and fire');
+    pollPads(fakePad([], 0.9, -0.9)); ok(!keys.ArrowLeft && !keys.Space && keys.ArrowRight && keys.ArrowUp, 'the stick must turn and thrust, and letting go of a button must release it');
+    pollPads(fakePad([], 0.3, -0.3)); ok(!keys.ArrowRight && !keys.ArrowUp, 'a stick near the middle must do nothing');
+    pollPads(fakePad([9])); pollPads(fakePad([9])); ok(paused, 'holding Start must pause once, not flicker');
+    pollPads(fakePad([])); pollPads(fakePad([9])); ok(!paused, 'a second press of Start must resume');
+    pollPads([{ mapping: '', axes: [-1, -1], buttons: [{ value: 1 }] }]); ok(!keys.ArrowLeft && !keys.Space && !keys.KeyP, 'a pad in an unknown layout must be ignored, and it releases Start');
+    ok(pads().length >= 0, 'reading the gamepads must never throw');
+    shake = 0; lives = 2; ship.alive = true; killShip(); ok(shake === SHAKE_TIME, 'a crash must rattle the picture'); draw(0);
+    ok(stop === HIT_STOP && flash === FLASH_TIME, 'a crash must stop the action and flash the picture');
+    const c0 = clock; step(0.01); ok(clock === c0 && flash === FLASH_TIME, 'nothing may move during the hit-stop');
+    step(1); step(0.01); ok(clock > c0 && flash < FLASH_TIME, 'the hit-stop must end');
+    let buzz = 0;
+    rumble([null, { vibrationActuator: { playEffect: () => { buzz++; } } }, { buttons: [] }, { vibrationActuator: { playEffect: () => { throw new Error('jammed'); } } }]);
+    ok(buzz === 1, 'a crash must rumble a pad that has a motor and put up with one that has not');
+    ship.alive = true; lives = START_LIVES;
+    setPaused(true); press('Tap'); ok(!paused, 'a tap must resume from the intermission');
+    scene = 'title'; press('Tap'); ok(scene === 'card', 'a tap must start the game');
+
+    const off = new OfflineAudioContext(1, 44100 * 15, 44100);
+    wire(off);
+    for (let b = 0; b < PROG.length; b++) scheduleBeat(b, b * 60 / MUSIC_BPM);   // one whole chorus
+    Object.values(SFX).forEach((f, i) => f(1 + i * 0.5));                         // effects land on top of the music
+    const d = (await off.startRendering()).getChannelData(0);
+    let peak = 0;
+    for (let i = 0; i < d.length; i++) { ok(Number.isFinite(d[i]), 'audio is not finite'); peak = Math.max(peak, Math.abs(d[i])); }
+    ok(peak > 0.05 && peak < 1, 'audio peak out of range: ' + peak.toFixed(3));
+    console.log('SELFTEST PASS (audio peak ' + peak.toFixed(2) + ', ' + n + ' frames)');
+  } catch (err) { console.error('SELFTEST FAIL: ' + err.message); }
+}
+
+if (SELFTEST) selfTest();
+else requestAnimationFrame(frame);
+</script>
+</body>
+</html>

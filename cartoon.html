@@ -1,0 +1,643 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT. Copyright (c) 2026 Lucas Van De Weerd. See LICENSE. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
+<title>The Rubber Hose Revue: the picture</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { position: absolute; inset: 0; margin: auto; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" role="img" aria-label="Looping black and white cartoon: a character in a straw hat dances on a rooftop under the moon while a dog plays a musical saw. Click to start. M mutes, S toggles sepia, F steadies the picture."></canvas>
+<script>
+'use strict';
+/*
+  THE RUBBER HOSE REVUE: an 8-second looping cartoon, drawn frame by frame on Canvas 2D.
+  No assets. Music comes from the Web Audio API and the picture follows the audio clock.
+
+  Keys: click or any key starts, M mutes, S toggles sepia, F steadies the picture (no flicker,
+        weave or scratches; on by default when the system asks for reduced motion).
+  URL flags: ?autostart (skip the start card, no sound), ?t=5.3 (freeze at that second),
+             ?selftest (draw every frame, render the music offline, log SELFTEST PASS/FAIL).
+*/
+
+// ---------- Tunables ----------
+const W = 800, H = 600;                 // logical 4:3 frame; everything is drawn in these units
+const BPM = 120, BEAT = 60 / BPM;
+const LOOP = 16 * BEAT;                 // 16 beats = 8 seconds
+const TITLE = 8 * BEAT;                 // the title card plays once, over an 8-beat vamp
+const DRAW_FPS = 12, FILM_FPS = 24;     // drawings "on twos": 12 new drawings a second on 24 fps film
+const SMEAR = 34;                       // a hand or foot moving further than this per drawing becomes a smear
+const VOLUME = 0.5;
+const INK = '#0c0c0c', PAPER = '#f1f1f1';
+const GROUND = 468;                     // y of the roof surface
+const MOON = { x: 650, y: 110, r: 62 };
+
+const params = new URLSearchParams(location.search);
+const FREEZE = params.has('t') ? parseFloat(params.get('t')) : null;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const TAU = Math.PI * 2;
+const hash = (n) => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };  // repeatable 0..1
+const lerp = (a, b, k) => a + (b - a) * k;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+let view = 1, lastFilm = -1, sepia = true;
+const reduce = matchMedia('(prefers-reduced-motion: reduce)');
+let calm = reduce.matches;              // steady picture: no flicker, gate-weave, scratches or dust
+reduce.addEventListener('change', (e) => { calm = e.matches; lastFilm = -1; });
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H), dpr = Math.min(devicePixelRatio || 1, 2);
+  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+  cv.width = Math.round(W * s * dpr); cv.height = Math.round(H * s * dpr);
+  view = cv.width / W; lastFilm = -1;
+}
+addEventListener('resize', resize); resize();
+
+// ---------- Ink: every outline goes through here ----------
+let BOIL = 0;   // index of the current drawing; reseeds the wobble so lines "boil" between drawings
+
+// Point generators
+const ell = (cx, cy, rx, ry, rot = 0, n = 22) => Array.from({ length: n }, (_, i) => {
+  const a = i / n * TAU, x = Math.cos(a) * rx, y = Math.sin(a) * ry, c = Math.cos(rot), s = Math.sin(rot);
+  return [cx + x * c - y * s, cy + x * s + y * c];
+});
+const arc = (cx, cy, r, a0, a1, n = 8) => Array.from({ length: n + 1 }, (_, i) => { const a = lerp(a0, a1, i / n); return [cx + Math.cos(a) * r, cy + Math.sin(a) * r]; });
+const bez = (p0, p1, p2, p3, n = 14) => Array.from({ length: n + 1 }, (_, i) => {
+  const t = i / n, u = 1 - t, a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+  return [a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0], a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]];
+});
+const rect = (x, y, w, h) => [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+
+// Draws a polyline the way a tired inker would: wandering path, uneven line weight.
+function ink(pts, o = {}) {
+  const { w = 3, fill = null, stroke = INK, close = false, seed = 1, j = 1.3, v = 0.35 } = o;
+  const n = pts.length, P = [];
+  for (let i = 0; i < (close ? n : n - 1); i++) {            // split long edges so straight lines wobble too
+    const a = pts[i], b = pts[(i + 1) % n], k = Math.max(1, Math.round(dist(a, b) / 22));
+    for (let q = 0; q < k; q++) P.push([lerp(a[0], b[0], q / k), lerp(a[1], b[1], q / k)]);
+  }
+  if (!close) P.push([pts[n - 1][0], pts[n - 1][1]]);
+  const s = seed * 12.9898 + BOIL * 78.233, pa = hash(s) * TAU, pb = hash(s + 1) * TAU, pc = hash(s + 2) * TAU;
+  for (let i = 0; i < P.length; i++) {
+    P[i][0] += j * (Math.sin(i * 0.9 + pa) + 0.6 * Math.sin(i * 2.3 + pb));
+    P[i][1] += j * (Math.cos(i * 0.8 + pb) + 0.6 * Math.sin(i * 2.1 + pc));
+  }
+  if (fill) {
+    ctx.beginPath(); P.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
+    ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+  }
+  if (!stroke || !w) return;
+  ctx.strokeStyle = stroke; ctx.lineCap = ctx.lineJoin = 'round';
+  for (let i = 0; i < (close ? P.length : P.length - 1); i++) {   // one stroke per segment so the weight can vary
+    const a = P[i], b = P[(i + 1) % P.length];
+    ctx.lineWidth = w * (1 + v * Math.sin(i * 0.55 + pc));
+    ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+  }
+}
+
+// A rubber hose limb: one curve, no elbows or knees. s = -1 gives an S-bend.
+function hose(a, b, bend, w, seed, s = 1, color = INK) {
+  const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1, nx = -dy / L, ny = dx / L;
+  const pts = bez(a, [a[0] + dx * 0.33 + nx * bend, a[1] + dy * 0.33 + ny * bend],
+                     [a[0] + dx * 0.66 + nx * bend * s, a[1] + dy * 0.66 + ny * bend * s], b);
+  if (color !== INK) ink(pts, { w: w + 4.5, seed, j: 0.9, v: 0.12 });       // outline for white limbs
+  ink(pts, { w, seed, j: 0.9, v: 0.12, stroke: color });
+}
+
+// White oval with a black pupil that has a wedge cut out of it. lx, ly: where it looks (-1..1).
+function pieEye(x, y, rx, ry, lx, ly, seed) {
+  ink(ell(x, y, rx, ry, 0, 14), { fill: PAPER, w: 2, close: true, seed, j: 0.6 });
+  const px = x + lx * rx * 0.32, py = y + ly * ry * 0.3 + ry * 0.15, r = rx * 0.6, R = ry * 0.55;
+  ink(ell(px, py, r, R, 0, 12), { fill: INK, w: 0, close: true, seed: seed + 1, j: 0.4 });
+  ctx.fillStyle = PAPER; ctx.beginPath(); ctx.moveTo(px, py);
+  ctx.lineTo(px + r * 0.5, py - R * 1.05); ctx.lineTo(px + r * 1.05, py - R * 0.35); ctx.fill();
+}
+
+// The classic three-dart white glove.
+function glove(p, ang, seed, r = 13) {
+  const c = Math.cos(ang), s = Math.sin(ang);
+  ink(ell(p[0] - s * r * 0.85, p[1] + c * r * 0.85, r * 0.5, r * 0.4, ang, 10), { fill: PAPER, w: 2.2, close: true, seed: seed + 1 });  // thumb
+  ink(ell(p[0], p[1], r, r * 0.86, ang, 16), { fill: PAPER, w: 2.5, close: true, seed });
+  for (let i = -1; i <= 1; i++) {
+    const ox = -s * i * r * 0.34, oy = c * i * r * 0.34;
+    ink([[p[0] + ox - c * r * 0.5, p[1] + oy - s * r * 0.5], [p[0] + ox + c * r * 0.05, p[1] + oy + s * r * 0.05]], { w: 1.5, seed: seed + 3 + i, j: 0.4 });
+  }
+}
+
+// Smear frame: one stretched drawing that covers the whole move, with speed lines behind it.
+function smear(prev, cur, r, fill, seed) {
+  const d = Math.min(dist(prev, cur), 110), ang = Math.atan2(cur[1] - prev[1], cur[0] - prev[0]), c = Math.cos(ang), s = Math.sin(ang);
+  const from = [cur[0] - c * d, cur[1] - s * d];
+  ink(ell((from[0] + cur[0]) / 2, (from[1] + cur[1]) / 2, d / 2 + r, r * 0.72, ang, 26), { fill, w: 2.5, close: true, seed });
+  for (let i = -1; i <= 1; i++) {
+    const ox = -s * i * r * 0.7, oy = c * i * r * 0.7, a = r + 10, b = r + 34 - 8 * Math.abs(i);
+    ink([[from[0] + ox - c * a, from[1] + oy - s * a], [from[0] + ox - c * b, from[1] + oy - s * b]], { w: 1.6, seed: seed + i });
+  }
+}
+
+// ---------- Period lettering ----------
+// Bold caps with oversized initials and a drop shadow; italics for the small print.
+function caps(txt, x, y, size, o = {}) {
+  const max = o.max || W - 110, face = 'px Georgia, "Times New Roman", Times, serif';
+  ctx.textBaseline = 'alphabetic';
+  if (o.italic) {
+    ctx.font = 'italic ' + size + face;
+    const w = ctx.measureText(txt).width;
+    if (w > max) return caps(txt, x, y, size * max / w * 0.99, o);
+    ctx.textAlign = 'center'; ctx.fillStyle = PAPER; ctx.fillText(txt, x, y);
+    return;
+  }
+  const g = []; let w = 0, lead = true;
+  for (const ch of txt) {
+    ctx.font = 'bold ' + (lead && /\w/.test(ch) ? size : size * 0.78) + face;
+    const c = ch.toUpperCase();
+    g.push([c, ctx.font, w]); w += ctx.measureText(c).width + size * 0.1;
+    lead = ch === ' ';
+  }
+  if (w > max) return caps(txt, x, y, size * max / w * 0.99, o);
+  ctx.textAlign = 'left';
+  g.forEach(([c, font, dx], i) => {
+    const gx = x - w / 2 + dx, gy = y + (hash(i * 7.3 + txt.length) - 0.5) * size * 0.05;   // hand-lettered baseline
+    ctx.font = font;
+    ctx.fillStyle = '#4a4a4a'; ctx.fillText(c, gx + size * 0.05, gy + size * 0.05);
+    ctx.fillStyle = PAPER; ctx.fillText(c, gx, gy);
+  });
+}
+
+// A title card: black, double rule border, diamonds in the corners. lines: [text, size, {italic}], '~' is a rule.
+function card(lines, a = 1, textA = 1) {
+  ctx.globalAlpha = a; ctx.fillStyle = '#080808'; ctx.fillRect(-20, -20, W + 40, H + 40);
+  ctx.globalAlpha = a * textA;
+  const m = 26;
+  ink(rect(m, m, W - 2 * m, H - 2 * m), { stroke: PAPER, w: 4, close: true, seed: 900, j: 0.8 });
+  ink(rect(m + 12, m + 12, W - 2 * m - 24, H - 2 * m - 24), { stroke: PAPER, w: 1.5, close: true, seed: 901, j: 0.8 });
+  for (const [x, y] of rect(m + 30, m + 30, W - 2 * m - 60, H - 2 * m - 60)) ink([[x, y - 8], [x + 8, y], [x, y + 8], [x - 8, y]], { fill: PAPER, w: 0, close: true, seed: 902 });
+  let y = H / 2 - lines.reduce((s, l) => s + l[1] * 1.4, 0) / 2;
+  for (const [txt, size, o] of lines) {
+    y += size * 1.4;
+    if (txt === '~') {
+      const ry = y - size * 0.7;
+      ink([[W / 2 - 120, ry], [W / 2 - 14, ry]], { stroke: PAPER, w: 1.5, seed: 903 });
+      ink([[W / 2 + 14, ry], [W / 2 + 120, ry]], { stroke: PAPER, w: 1.5, seed: 904 });
+      ink([[W / 2, ry - 6], [W / 2 + 6, ry], [W / 2, ry + 6], [W / 2 - 6, ry]], { fill: PAPER, w: 0, close: true, seed: 905 });
+    } else caps(txt, W / 2, y - size * 0.35, size, o);
+  }
+  ctx.globalAlpha = 1;
+}
+const IT = { italic: true };
+const START_CARD = [['The Rubber Hose Revue', 46], ['~', 30], ['Click to start the picture', 27, IT], ['M mutes the orchestra  ·  S toggles sepia  ·  F steadies the picture', 16, IT]];
+const TITLE_CARD = [['The Moonlight Picture Company presents', 20, IT], ['The Rubber Hose', 62], ['Revue', 98], ['~', 30],
+                    ['A rooftop frolic in one reel, with musical saw', 21, IT], ['MCMXXX', 15]];
+
+// ---------- Film look: drawn over every frame ----------
+const grain = document.createElement('canvas'); grain.width = grain.height = 160;
+{
+  const g = grain.getContext('2d'), im = g.createImageData(160, 160);
+  for (let i = 0; i < im.data.length; i += 4) {
+    im.data[i] = im.data[i + 1] = im.data[i + 2] = Math.random() < 0.5 ? 0 : 255; im.data[i + 3] = Math.random() * 60;
+  }
+  g.putImageData(im, 0, 0);
+}
+const grainPat = ctx.createPattern(grain, 'repeat');
+
+function filmPass(n) {                         // n: film frame number, so the dirt changes 24 times a second
+  const r = (k) => hash((calm ? 0 : n) * 1.618 + k);     // calm: the grain and the exposure hold still
+  if (sepia) {
+    ctx.globalCompositeOperation = 'multiply'; ctx.fillStyle = '#f2d9aa'; ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'lighten'; ctx.fillStyle = '#1d1309'; ctx.fillRect(0, 0, W, H);   // blacks go brown
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.save(); ctx.translate(-r(1) * 160, -r(2) * 160); ctx.fillStyle = grainPat; ctx.fillRect(0, 0, W + 160, H + 160); ctx.restore();
+  if (!calm) {
+    // scratches: one that lingers for most of a second, plus the odd single-frame one
+    ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = 1;
+    const vline = (x) => { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x + (r(7) - 0.5) * 6, H); ctx.stroke(); };
+    const linger = hash(Math.floor(n / 18) * 9.1);
+    if (linger < 0.45) vline(40 + linger / 0.45 * (W - 80) + r(3) * 2);
+    if (r(4) < 0.3) vline(r(5) * W);
+    // dust and hairs
+    ctx.fillStyle = 'rgba(0,0,0,.55)';
+    for (let i = 0; i < 3; i++) if (r(10 + i) < 0.35) { ctx.beginPath(); ctx.ellipse(r(20 + i) * W, r(30 + i) * H, 1 + r(40 + i) * 3, 1 + r(50 + i) * 2, r(60 + i) * 3, 0, TAU); ctx.fill(); }
+  }
+  // flicker
+  ctx.fillStyle = 'rgba(0,0,0,' + (0.02 + 0.09 * r(6)).toFixed(3) + ')'; ctx.fillRect(0, 0, W, H);
+  // vignette and the rounded corners of the projector gate
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * 0.36, W / 2, H / 2, H * 0.86);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,.85)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#000'; ctx.beginPath(); ctx.rect(-5, -5, W + 10, H + 10); ctx.roundRect(6, 6, W - 12, H - 12, 26); ctx.fill('evenodd');
+}
+
+// ---------- Music (Web Audio) ----------
+let AC = null, master = null, muted = false;
+const hz = (m) => 440 * Math.pow(2, (m - 69) / 12);
+
+// Everything plays through a narrow band, like a gramophone horn, over a bed of surface crackle.
+function wire(ac) {
+  AC = ac;
+  master = ac.createGain(); master.gain.value = muted ? 0 : VOLUME;
+  const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 260;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3400;
+  master.connect(hp).connect(lp).connect(ac.destination);
+  const buf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = (Math.random() - 0.5) * 0.02 + (Math.random() < 0.0006 ? (Math.random() - 0.5) * 0.8 : 0);
+  const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(master); src.start();
+}
+
+// One plucked note. `from` slides the pitch in from another note over `glide` seconds.
+function tone(type, midi, at, dur, vol, from = midi, glide = 0.1) {
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(hz(from), at);
+  if (from !== midi) o.frequency.exponentialRampToValueAtTime(hz(midi), at + glide);
+  g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol, at + 0.008); g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+  o.connect(g).connect(master); o.start(at); o.stop(at + dur + 0.02);
+}
+
+// The dog's saw: a sine wave with vibrato that slides between notes.
+const SAW = [88, 84, 85, 88, 86, 83, 84, 86];             // one note every two beats
+const SAW_GLIDE = 0.15;                                    // fraction of the note spent sliding
+function sawPitch(beat) {                                  // shared by the sound and by the drawing of the blade
+  const i = Math.floor(beat / 2) % 8, u = clamp((beat / 2 % 1) / SAW_GLIDE, 0, 1);
+  return lerp(SAW[(i + 7) % 8], SAW[i], u * u * (3 - 2 * u));
+}
+function sawNote(i, at) {
+  const dur = 2 * BEAT, o = AC.createOscillator(), g = AC.createGain(), lfo = AC.createOscillator(), depth = AC.createGain();
+  o.frequency.setValueAtTime(hz(SAW[(i + 7) % 8]), at); o.frequency.linearRampToValueAtTime(hz(SAW[i]), at + dur * SAW_GLIDE);
+  lfo.frequency.value = 6; depth.gain.value = hz(SAW[i]) * 0.012; lfo.connect(depth).connect(o.frequency);
+  // each note cross-fades into the next (it starts on the last one's pitch), so it reads as one long bowed tone
+  g.gain.setValueAtTime(0.0001, at); g.gain.linearRampToValueAtTime(0.11, at + 0.04);
+  g.gain.setValueAtTime(0.11, at + dur); g.gain.linearRampToValueAtTime(0.0001, at + dur + 0.04);
+  o.connect(g).connect(master); o.start(at); o.stop(at + dur + 0.05); lfo.start(at); lfo.stop(at + dur + 0.05);
+}
+
+// The dog's howl: one voice that swoops up, holds, and sags. Lasts two beats.
+function howlNote(at) {
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = 'triangle';
+  o.frequency.setValueAtTime(hz(69), at); o.frequency.exponentialRampToValueAtTime(hz(81), at + 0.3);
+  o.frequency.setValueAtTime(hz(81), at + 0.5); o.frequency.exponentialRampToValueAtTime(hz(74), at + 1);
+  g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(0.13, at + 0.06);
+  g.gain.setValueAtTime(0.13, at + 0.7); g.gain.exponentialRampToValueAtTime(0.0001, at + 1);
+  o.connect(g).connect(master); o.start(at); o.stop(at + 1.02);
+}
+
+// Chords: [bass root, bass fifth, right-hand stab]
+const CH = { C: [48, 43, [60, 64, 67]], A7: [45, 52, [61, 64, 67]], D7: [50, 45, [60, 62, 66]], G7: [43, 50, [59, 62, 65]] };
+const PROG = ['C', 'C', 'C', 'C', 'A7', 'A7', 'A7', 'A7', 'D7', 'D7', 'G7', 'G7', 'C', 'C', 'G7', 'G7'];
+const VAMP = ['C', 'C', 'G7', 'G7', 'C', 'C', 'G7', 'G7'];
+// Melody: [beat, length in beats, MIDI note]. Short-long-short figures give the ragtime syncopation.
+const MELODY = [
+  [0, .25, 76], [.25, .5, 79], [.75, .25, 76], [1, .5, 84], [1.5, .5, 79], [2, .25, 81], [2.25, .5, 79], [2.75, .25, 76], [3, 1, 79],
+  [4, .25, 76], [4.25, .5, 81], [4.75, .25, 76], [5, .5, 85], [5.5, .5, 81], [6, .25, 83], [6.25, .5, 81], [6.75, .25, 79], [7, 1, 76],
+  [8, .25, 78], [8.25, .5, 81], [8.75, .25, 78], [9, .5, 86], [9.5, .5, 84], [10, .25, 83], [10.25, .5, 86], [10.75, .25, 83], [11, 1, 79],
+  [14, .25, 88], [14.25, .25, 84], [14.5, .5, 79], [15, .25, 79], [15.25, .25, 83], [15.5, .5, 86],   // bar 4 opens with the slide whistle instead
+];
+
+// Schedules everything that starts within beat b (counted from the start of the title card) at audio time `at`.
+function scheduleBeat(b, at) {
+  const vamp = b < 8, lb = vamp ? b : (b - 8) % 16, prog = vamp ? VAMP : PROG, [root, fifth, stab] = CH[prog[lb]];
+  if (lb % 2 === 0) tone('square', lb % 4 === 0 || prog[lb] !== prog[lb - 2] ? root : fifth, at, 0.3, 0.15);   // oom
+  else stab.forEach((m) => tone('square', m, at, 0.16, 0.055));                                               // pah
+  if (vamp) { if (b === 7) { tone('triangle', 79, at, 0.2, 0.18); tone('triangle', 74, at + BEAT / 2, 0.2, 0.18); } return; }
+  for (const [s, d, m] of MELODY) if (Math.floor(s) === lb) tone('triangle', m, at + (s - lb) * BEAT, d * BEAT * 0.95, 0.19);
+  if (lb % 2 === 0) sawNote(lb / 2, at);
+  if (lb === 9) howlNote(at);
+  if (lb === 12) { tone('sine', 96, at, 0.3, 0.15, 72, 0.28); tone('triangle', 100, at + 0.6 * BEAT, 0.3, 0.17); }   // arm goes up; "ding" on the moon
+  if (lb === 13) { tone('sine', 62, at + 0.4 * BEAT, 0.2, 0.16, 96, 0.14); tone('sine', 60, at + 0.75 * BEAT, 0.35, 0.14, 67, 0.3); }  // snap back, boing
+}
+
+// ---------- The clock ----------
+// `elapsed` advances with the audio clock when sound is running, so picture and music cannot drift apart.
+let started = false, elapsed = 0, nextBeat = 0, lastP = performance.now() / 1000, lastA = null;
+function tick() {
+  const p = performance.now() / 1000;
+  if (started && FREEZE === null) {
+    if (AC && AC.state === 'running') { const a = AC.currentTime; if (lastA !== null) elapsed += a - lastA; lastA = a; }
+    else { elapsed += Math.min(p - lastP, 0.1); lastA = null; }      // silent fallback; clamped so a stalled tab does not jump
+  }
+  lastP = p;
+}
+function music() {
+  if (!AC) return;
+  if (nextBeat * BEAT < elapsed - 0.1) nextBeat = Math.ceil(elapsed / BEAT);   // never play catch-up after a stall
+  while (nextBeat * BEAT < elapsed + 0.3) {
+    if (AC.state === 'running') scheduleBeat(nextBeat, AC.currentTime + nextBeat * BEAT - elapsed);
+    nextBeat++;
+  }
+}
+function start() {
+  if (started) return;
+  started = true;
+  try { wire(new (window.AudioContext || window.webkitAudioContext)()); AC.resume(); } catch (err) { AC = null; }   // no audio: run as a silent picture
+}
+
+// ---------- Choreography ----------
+// How far the right arm is stretched toward the moon: 0 = normal, 1 = touching.
+function stretchK(beat) {
+  if (beat < 12 || beat > 14.6) return 0;
+  if (beat < 12.6) { const u = (beat - 12) / 0.6 - 1; return 1 + 2.2 * u * u * u + 1.2 * u * u; }   // shoots out and overshoots
+  if (beat < 13.4) return 1 + 0.03 * Math.sin((beat - 12.6) * Math.PI * 5);                         // tickles the moon
+  if (beat < 13.7) { const u = (beat - 13.4) / 0.3; return 1 - u * u; }                             // snaps back
+  const u = (beat - 13.7) / 0.9; return -0.14 * Math.sin(u * Math.PI * 4) * (1 - u);                // and wobbles like rubber
+}
+
+// Where every part of the dancer is at loop time t (seconds). Pure, so the previous drawing can be compared for smears.
+function pose(t) {
+  const beat = ((t / BEAT) % 16 + 16) % 16, ph = beat % 1, bi = Math.floor(beat);
+  const up = Math.sin(Math.PI * ph);                       // 0 on the beat, 1 halfway between beats
+  const hop = up * (bi === 7 ? 2.1 : 1);                   // a big "hey!" jump ends the second bar
+  const squash = Math.pow(1 - up, 4);                      // flattens as the feet land on the beat
+  const sway = Math.sin(beat * Math.PI / 2);               // side to side over four beats
+  const x = 462 + sway * 44, lift = hop * 20;
+  const by = GROUND - 92 - lift + squash * 12;             // body centre
+  const sx = 1 + 0.2 * squash - 0.07 * hop, sy = 1 - 0.2 * squash + 0.1 * hop;
+  const shY = by - 30 * sy;                                // shoulder height
+  const kick = bi % 2 ? 1 : -1;                            // feet take turns to kick
+  const spin = bi === 11 ? ph : 0, turn = Math.cos(TAU * spin);   // one full turn on the last beat of bar three; turn is 1 when facing us
+  const foot = (side) => side === kick ? [x + side * (26 + 62 * up) * turn, GROUND - 4 - 52 * up - lift * 0.5] : [x + side * 26 * turn, GROUND - 4 - lift * 0.7];
+  const swing = Math.sin(beat * Math.PI);
+  let handL = [x - 80 + 12 * swing, shY + 8 - 58 * swing], handR = [x + 80 + 12 * swing, shY + 8 + 58 * swing];
+  if (bi === 7) { handL = [lerp(handL[0], x - 66, up), lerp(handL[1], shY - 96, up)]; handR = [lerp(handR[0], x + 66, up), lerp(handR[1], shY - 96, up)]; }
+  if (bi === 11) {                                         // arms fly out level and go round with the body
+    const k = Math.min(1, 4 * ph, 4 * (1 - ph));
+    handL = [lerp(handL[0], x - 92 * turn, k), lerp(handL[1], shY - 6, k)]; handR = [lerp(handR[0], x + 92 * turn, k), lerp(handR[1], shY - 6, k)];
+  }
+  // the boater leaves the head a moment after each landing; on the "hey!" jump it flies off, flips once and lands on the next beat
+  const hatLift = bi === 7 ? 78 * up : 12 * Math.max(0, Math.sin(TAU * (ph - 0.12))), hatFlip = bi === 7 ? TAU * ph : 0;
+  const sk = stretchK(beat);
+  handR = [lerp(handR[0], MOON.x - 34, sk), lerp(handR[1], MOON.y + 44, sk)];
+  return { beat, ph, up, hop, squash, sway, x, lift, by, sx, sy, shY, kick, sk, spin, turn, hatLift, hatFlip, handL, handR, footL: foot(-1), footR: foot(1), head: [x + sway * 12, by - 70 * sy - hop * 4] };
+}
+
+// The dog: 0 = bowing away, 1 = head thrown back in a howl (beats 9 to 11).
+function dogPose(beat) {
+  const u = (beat - 9) / 2;
+  return { howl: u > 0 && u < 1 ? clamp(Math.min(u, 1 - u) * 5, 0, 1) : 0 };
+}
+
+// ---------- The set ----------
+function drawSet() {
+  const g = ctx.createLinearGradient(0, 0, 0, GROUND);
+  g.addColorStop(0, '#4a4a4a'); g.addColorStop(1, '#929292');
+  ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
+  for (let i = 0; i < 18; i++) {                            // stars that twinkle with the boil
+    const x = 30 + hash(i * 3.1) * 740, y = 20 + hash(i * 5.7) * 260, r = 3 + 4 * hash(i + BOIL * 0.37);
+    if (Math.hypot(x - MOON.x, y - MOON.y) < MOON.r + 46) continue;
+    ink([[x - r, y], [x + r, y]], { w: 1.6, stroke: PAPER, seed: i }); ink([[x, y - r], [x, y + r]], { w: 1.6, stroke: PAPER, seed: i + 30 });
+  }
+  for (let i = 0; i < 9; i++) {                             // the town behind
+    const x = -20 + i * 95 + hash(i) * 20, w = 70 + hash(i + 9) * 50, h = 50 + hash(i + 20) * 100, y = GROUND + 20 - h;
+    ink([[x, GROUND + 30], [x, y], [x + w, y], [x + w, GROUND + 30]], { fill: '#666', stroke: '#444', w: 2, close: true, seed: 40 + i });   // mid-grey, so the black players read against it
+    ctx.fillStyle = '#d8d8d8';
+    for (let c = 0; c < 3; c++) for (let r = 0; r < 4; r++) if (hash(i * 13 + c * 5 + r) > 0.62) ctx.fillRect(x + 12 + c * 20, y + 14 + r * 24, 9, 13);
+  }
+  // the roof we dance on
+  ink([[-20, GROUND], [W + 20, GROUND], [W + 20, H + 20], [-20, H + 20]], { fill: '#bdbdbd', w: 3, close: true, seed: 3 });
+  for (let i = 0; i < 9; i++) { const y = GROUND + 16 + (i % 3) * 22; ink([[i * 100 - 30, y], [i * 100 + 34, y]], { w: 1.5, stroke: '#8c8c8c', seed: 100 + i }); }   // tar-paper seams
+  ink([[-20, 548], [W + 20, 548], [W + 20, H + 20], [-20, H + 20]], { fill: '#6f6f6f', w: 3, close: true, seed: 4 });   // cornice
+  for (let x = 0; x < W; x += 40) ink(rect(x + 8, 562, 22, 18), { fill: '#8f8f8f', w: 2, close: true, seed: 110 + x });
+  // the dog's chimney
+  ink(rect(120, 390, 96, GROUND - 382), { fill: '#9c9c9c', w: 3, close: true, seed: 5 });
+  for (let r = 0; r < 4; r++) {
+    const y = 410 + r * 18;
+    ink([[122, y], [214, y]], { w: 1.3, stroke: '#666', seed: 130 + r });
+    for (let c = 0; c < 3; c++) { const bx = 140 + c * 28 + (r % 2) * 14; ink([[bx, y], [bx, y + 18]], { w: 1.3, stroke: '#666', seed: 140 + r * 3 + c }); }
+  }
+  ink(rect(110, 379, 116, 13), { fill: '#d0d0d0', w: 3, close: true, seed: 6 });
+  // a stovepipe puffing in time at the far side
+  ink(rect(724, 412, 20, GROUND - 408), { fill: '#555', w: 2.5, close: true, seed: 7 });
+  ink([[714, 412], [734, 396], [754, 412]], { fill: '#333', w: 2.5, close: true, seed: 8 });
+}
+
+function drawSmoke(beat) {
+  for (let k = 0; k < 3; k++) {
+    const age = (beat / 4 + k / 3) % 1;
+    ctx.globalAlpha = 0.75 * (1 - age);
+    ink(ell(748 + 14 * Math.sin(age * 5 + k), 392 - 90 * age, 6 + 14 * age, 5 + 12 * age, 0, 12), { fill: '#dcdcdc', w: 2, close: true, seed: 150 + k });
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawMoon(beat) {
+  const tap = clamp(1 - Math.abs(beat - 13) / 0.6, 0, 1), tickled = beat > 12.5 && beat < 13.5, r = MOON.r;
+  const g = ctx.createRadialGradient(MOON.x, MOON.y, r * 0.9, MOON.x, MOON.y, r * 2.4);
+  g.addColorStop(0, 'rgba(255,255,255,.4)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(MOON.x - r * 2.5, MOON.y - r * 2.5, r * 5, r * 5);
+  ctx.save(); ctx.translate(MOON.x, MOON.y + Math.sin(beat * Math.PI) * 3); ctx.scale(1 + tap * 0.08, 1 - tap * 0.1);
+  ink(ell(0, 0, r, r, 0, 30), { fill: PAPER, w: 3, close: true, seed: 10 });
+  for (const [x, y, a, b] of [[-30, -34, 9, 7], [36, -22, 6, 5], [34, 30, 7, 5]]) ink(ell(x, y, a, b, 0, 10), { fill: '#d6d6d6', w: 1.5, stroke: '#999', close: true, seed: 11 + x });
+  if (tickled) {                                             // eyes squeezed shut: > <
+    ink([[-30, -14], [-16, -7], [-30, 0]], { w: 3, seed: 12 }); ink([[30, -14], [16, -7], [30, 0]], { w: 3, seed: 13 });
+  } else for (const s of [-1, 1]) {
+    if (s > 0 && beat % 8 > 3 && beat % 8 < 3.6) ink(arc(20, -4, 9, Math.PI * 1.1, Math.PI * 1.9, 6), { w: 3, seed: 15 });   // a wink near the end of bars one and three
+    else pieEye(s * 20, -8, 9, 14, -0.8, 0.9, 12 + s * 2);                                                              // watching the dancer
+  }
+  ink(bez([-26, 18], [-12, 34 + tap * 12], [12, 34 + tap * 12], [26, 18], 10), { w: 3, seed: 16 });
+  ink(arc(-28, 17, 5, 2.2, 4.4, 4), { w: 2, seed: 17 }); ink(arc(28, 17, 5, -1.3, 0.9, 4), { w: 2, seed: 18 });
+  ctx.restore();
+}
+
+// ---------- The dog and his saw ----------
+function sawGeom(bend, e) {                                  // bend follows the pitch; the blade keeps its S-curve
+  const h = [198, 386], tip = [262 + bend * 20, 256], vib = Math.sin(e * 40) * 1.5;
+  const mid = bez(h, [h[0] + 46 + bend * 30 + vib, h[1] - 44], [tip[0] - 46 - bend * 30 - vib, tip[1] + 44], tip, 22);
+  const L = [], R = [];
+  mid.forEach(([x, y], i) => {
+    const p = mid[Math.max(0, i - 1)], q = mid[Math.min(mid.length - 1, i + 1)], d = dist(p, q) || 1;
+    const nx = -(q[1] - p[1]) / d, ny = (q[0] - p[0]) / d, w = lerp(11, 4, i / (mid.length - 1)), tooth = i % 2 ? 4 : 0;
+    L.push([x + nx * w, y + ny * w]); R.push([x - nx * (w + tooth), y - ny * (w + tooth)]);   // every other point pokes out: teeth
+  });
+  return { h, tip, outline: [...L, ...R.reverse()], bm: mid[9] };
+}
+
+function drawDog(beat, e) {
+  const ph = beat % 1, bob = Math.pow(1 - Math.sin(Math.PI * ph), 3) * 5, cx = 166, top = 380;
+  const wag = Math.sin(beat * TAU), watching = beat > 12 && beat < 14.4;
+  const saw = sawGeom((sawPitch(beat) - 85.5) / 2.5, e);
+  hose([cx - 24, top - 12], [cx - 62, top - 48 + 12 * wag], 16 * wag, 6, 60, -1);                      // tail
+  for (const s of [0, 1]) {                                                                           // feet tap in turn
+    const tap = Math.floor(beat) % 2 === s ? Math.sin(Math.PI * ph) * 10 : 0, fx = cx - 10 + s * 32, fy = top + 48 - tap;
+    hose([cx - 4 + s * 16, top - 10], [fx, fy - 6], s ? -8 : 8, 7, 61 + s, 1, PAPER);
+    ink(ell(fx + 8, fy, 15, 9, -tap * 0.04, 14), { fill: PAPER, w: 2.5, close: true, seed: 63 + s });
+  }
+  hose([cx + 18, top - 60 + bob], saw.tip, -22, 7, 65, 1, PAPER);                                      // far arm steadies the tip
+  ink(ell(cx, top - 36 + bob * 0.5, 29, 38), { fill: PAPER, w: 3, close: true, seed: 66 });           // body
+  ink(ell(cx - 12, top - 28 + bob * 0.5, 9, 12, 0.3, 12), { fill: INK, w: 0, close: true, seed: 67 });  // spot
+  const howl = dogPose(beat).howl;
+  ctx.save(); ctx.translate(cx + 6, top - 98 + bob); ctx.rotate(-0.8 * howl);                        // nose to the sky
+  ink(ell(0, 0, 27, 26), { fill: PAPER, w: 3, close: true, seed: 68 });                               // head
+  ink(ell(24, 9, 19, 13, 0, 16), { fill: PAPER, w: 3, close: true, seed: 69 });                       // muzzle
+  ink(ell(11, 7, 13, 10, 0, 12), { fill: PAPER, w: 0, close: true, seed: 69 });                       // hides the seam between them
+  ink(ell(41, 3, 7, 5.5, 0, 10), { fill: INK, w: 1, close: true, seed: 70 });                         // nose
+  if (howl > 0.3) {                                                                                   // mouth a round "oo", with the sound coming out
+    ink(ell(33, 19, 7, 3 + 7 * howl, 0.2, 10), { fill: INK, w: 1.5, close: true, seed: 71 });
+    for (let i = -1; i <= 1; i++) ink([[54, 18 + i * 9], [66 + 4 * Math.sin(beat * TAU * 2), 20 + i * 15]], { w: 2, seed: 84 + i });
+  } else ink(bez([10, 15], [20, 24], [34, 22], [40, 14], 8), { w: 2, seed: 71 });
+  if (watching) { pieEye(2, -8, 6, 10, 1, -1, 72); pieEye(17, -9, 6, 10, 1, -1, 74); }                // stares at the long arm
+  else for (const x of [2, 17]) ink(arc(x, -5, 6, Math.PI * 1.1, Math.PI * 1.9, 6), { w: 2.5, seed: 72 + x });   // eyes shut, lost in the music
+  const ea = 0.25 + 0.3 * Math.sin(beat * Math.PI - 0.8) + 0.8 * howl;                               // ear flops behind the beat and still hangs down in a howl
+  ink(ell(-20 - Math.sin(ea) * 22, -14 + Math.cos(ea) * 22, 10, 25, ea), { fill: INK, w: 2, close: true, seed: 76 });
+  ctx.restore();
+  ink(saw.outline, { fill: '#dedede', w: 2, close: true, seed: 77, j: 0.5 });                         // blade
+  ink(ell(saw.h[0], saw.h[1], 13, 9, -0.5, 12), { fill: '#3a3a3a', w: 2.5, close: true, seed: 78 });  // handle between the knees
+  glove(saw.tip, -1, 79, 10);
+  const slide = Math.sin(beat * Math.PI) * 24, a = [saw.bm[0] - 54 + slide, saw.bm[1] + 9], b = [saw.bm[0] + 66 + slide, saw.bm[1] - 7];
+  ink([a, b], { w: 3, seed: 80 }); ink([[a[0], a[1] - 5], [b[0], b[1] - 5]], { w: 1.2, stroke: PAPER, seed: 81 });   // bow and its hair
+  hose([cx + 14, top - 52 + bob], b, 30, 7, 82, 1, PAPER);                                            // near arm bows
+  glove(b, 0, 83, 10);
+}
+
+function drawNotes(beat) {                                   // eighth notes drift up from the saw
+  for (let k = 0; k < 3; k++) {
+    const age = (beat / 2 + k / 3) % 1, x = 292 + 46 * age + 9 * Math.sin(age * 9 + k), y = 240 - 120 * age;
+    ctx.globalAlpha = clamp(Math.min(age * 6, 3 * (1 - age)), 0, 1);
+    ink(ell(x, y, 6, 4.5, -0.4, 10), { fill: INK, w: 1, close: true, seed: 90 + k });
+    ink([[x + 5, y - 1], [x + 5, y - 20], [x + 12, y - 14]], { w: 2, seed: 93 + k });
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- The dancer ----------
+function drawHead(p) {
+  const look = clamp(p.sk, 0, 1);                            // watches the hand when it goes for the moon
+  const fc = p.turn, fs = Math.sin(TAU * p.spin);            // how much of the face we can see, and which way it has slid
+  ctx.save(); ctx.translate(p.head[0], p.head[1]); ctx.rotate(p.sway * 0.14 - look * 0.25); ctx.scale(p.sx, p.sy);
+  ink(ell(0, 0, 36, 35, 0, 26), { fill: INK, w: 2, close: true, seed: 40 });
+  if (fc > 0.08) {                                           // otherwise it is the back of his head
+    ctx.save(); ctx.translate(fs * 22, 0); ctx.scale(fc, 1);
+    for (const e of [ell(-12, -6, 14, 19), ell(12, -6, 14, 19), ell(0, 13, 29, 17)]) ink(e, { fill: PAPER, w: 0, close: true, seed: 41 });   // white face
+    if (p.beat % 4 > 3.7 && !look) for (const s of [-1, 1]) ink(arc(s * 12, -4, 8, Math.PI * 1.15, Math.PI * 1.85, 6), { w: 2.5, seed: 42 + s });   // blink
+    else for (const s of [-1, 1]) pieEye(s * 12, -7, 8.5, 14, look * 0.9 + p.sway * 0.4, -look, 43 + s * 2);
+    ink(ell(0, 9, 7, 5, 0, 10), { fill: INK, w: 1, close: true, seed: 47 });
+    const open = 3 + 7 * Math.min(p.hop, 1.3);               // grin opens wider at the top of each hop
+    ink([...bez([-21, 14], [-12, 20], [12, 20], [21, 14], 8), ...bez([21, 14], [14, 22 + open * 2], [-14, 22 + open * 2], [-21, 14], 8)], { fill: INK, w: 2, close: true, seed: 48 });
+    ink(ell(0, 19 + open, 8, open * 0.42, 0, 10), { fill: '#9a9a9a', w: 0, close: true, seed: 49 });   // tongue
+    ctx.restore();
+  }
+  // straw boater, turned about its own middle so it can flip in the air
+  ctx.translate(0, -38 - p.hatLift); ctx.rotate(0.1 + p.hatFlip); ctx.translate(0, 38);
+  ink([[-17, -30], [-16, -50], [16, -50], [17, -30]], { fill: PAPER, w: 2.5, close: true, seed: 50 });
+  ink([[-17, -37], [17, -37], [17, -43], [-17, -43]], { fill: INK, w: 0, close: true, seed: 51 });
+  ink(ell(0, -30, 30, 5.5, 0, 18), { fill: PAPER, w: 2.5, close: true, seed: 52 });
+  ctx.restore();
+}
+
+function shoe(f, side, tilt, seed) {
+  ink(ell(f[0] + side * 8, f[1], 21, 11, -side * tilt, 16), { fill: INK, w: 2, close: true, seed });
+  ink(arc(f[0] + side * 12, f[1] - 1, 9, -2.2, -1.1, 4), { stroke: PAPER, w: 2, seed: seed + 1, j: 0.5 });   // shine
+}
+
+function drawDancer(p, q) {                                  // p: this drawing's pose, q: the previous drawing's
+  ctx.fillStyle = 'rgba(0,0,0,.3)'; ctx.beginPath(); ctx.ellipse(p.x, GROUND + 10, Math.max(20, 52 - p.lift * 0.6), 7, 0, 0, TAU); ctx.fill();
+  const hipY = p.by + 28 * p.sy, kL = p.kick < 0 ? p.up : 0, kR = p.kick > 0 ? p.up : 0;
+  hose([p.x - 13 * p.turn, hipY], [p.footL[0] + 6, p.footL[1] - 8], kL ? -22 * kL : 10 + 14 * p.squash, 8, 31);
+  hose([p.x + 13 * p.turn, hipY], [p.footR[0] - 6, p.footR[1] - 8], kR ? 22 * kR : -10 - 14 * p.squash, 8, 32);
+  if (dist(p.footL, q.footL) > SMEAR) smear(q.footL, p.footL, 13, INK, 33); else shoe(p.footL, -1, kL * 0.6, 33);
+  if (dist(p.footR, q.footR) > SMEAR) smear(q.footR, p.footR, 13, INK, 35); else shoe(p.footR, 1, kR * 0.6, 35);
+  ctx.save(); ctx.translate(p.x, p.by); ctx.scale(p.sx, p.sy);
+  ink(ell(0, 0, 30, 40), { fill: INK, w: 2, close: true, seed: 37 });                                 // pear-shaped body
+  for (const s of [-1, 1]) {                                                                          // two buttons, which ride round the body in a spin
+    const a = TAU * p.spin + s * 0.7;
+    if (Math.cos(a) > 0.1) ink(ell(15.5 * Math.sin(a), 14, 5 * Math.cos(a) + 1, 7, 0, 10), { fill: PAPER, w: 0, close: true, seed: 38 + s });
+  }
+  ctx.restore();
+  if (p.spin) for (const k of [0, 1]) {                                                               // whirl lines
+    const a = TAU * p.spin * 2 + k * Math.PI;
+    ink(arc(p.x, p.by - 20 + k * 50, 66, a, a + 1.1, 6).map(([x, y]) => [x, p.by - 20 + k * 50 + (y - (p.by - 20 + k * 50)) * 0.28]), { w: 2, seed: 58 + k });
+  }
+  drawHead(p);
+  const shL = [p.x - 20 * p.sx * p.turn, p.shY], shR = [p.x + 20 * p.sx * p.turn, p.shY], wave = 16 * Math.sin(p.beat * Math.PI + 1);
+  hose(shL, p.handL, wave, 8, 53);
+  // the rubber arm gets thinner as it gets longer, and wobbles in an S while it is out
+  const len = dist(shR, p.handR), out = clamp(p.sk, 0, 1);
+  hose(shR, p.handR, -wave * (1 - out) + (Math.abs(p.sk) > 0.02 ? 16 * Math.sin(p.beat * TAU * 3) : 0), 8 * clamp(Math.sqrt(95 / len), 0.5, 1), 54, out > 0.3 ? -1 : 1);
+  for (const [h, g, sh, seed] of [[p.handL, q.handL, shL, 55], [p.handR, q.handR, shR, 60]]) {
+    if (dist(h, g) > SMEAR) smear(g, h, 13, PAPER, seed);
+    else glove(h, Math.atan2(h[1] - sh[1], h[0] - sh[0]), seed);
+  }
+}
+
+// ---------- One frame ----------
+function render(e, film) {
+  e = Math.max(0, e);
+  const f = Math.floor(e * DRAW_FPS + 1e-6), td = f / DRAW_FPS;         // snap to the current drawing
+  const t = ((td - TITLE) % LOOP + LOOP) % LOOP, beat = t / BEAT;
+  ctx.setTransform(view, 0, 0, view, 0, 0);
+  // gate weave: the whole picture wanders a pixel or two in the projector
+  if (!calm) ctx.translate(Math.sin(film * 0.31) * 1.1 + (hash(film) - 0.5), Math.sin(film * 0.17) * 1.4 + (hash(film + 0.5) < 0.04 ? 3 : 0));
+  if (!started) { BOIL = Math.floor(film / 4); card(START_CARD); }
+  else {
+    BOIL = Math.floor(f / 2);                                           // the set boils gently
+    drawSet(); drawSmoke(beat); drawMoon(beat);
+    BOIL = f;                                                           // the players are redrawn every drawing
+    drawDog(beat, td); drawNotes(beat);
+    drawDancer(pose(t), pose(t - 1 / DRAW_FPS));
+    if (e < TITLE) { BOIL = Math.floor(f / 3); card(TITLE_CARD, clamp((TITLE - e) / 0.9, 0, 1), clamp((e - 0.2) / 0.8, 0, 1)); }
+  }
+  ctx.setTransform(view, 0, 0, view, 0, 0);
+  filmPass(film);
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  tick();
+  if (started) music();
+  const film = Math.floor(performance.now() / 1000 * FILM_FPS);
+  if (film === lastFilm) return;                                        // nothing changes between film frames
+  lastFilm = film;
+  // hold the picture back by the output latency so the feet land when the beat is heard
+  render(FREEZE !== null ? FREEZE : elapsed - (AC && AC.state === 'running' ? AC.outputLatency || AC.baseLatency || 0 : 0), film);
+}
+
+// ---------- Input ----------
+cv.addEventListener('click', start);
+addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.code === 'KeyM') { muted = !muted; if (master) master.gain.value = muted ? 0 : VOLUME; }
+  else if (e.code === 'KeyS') { sepia = !sepia; lastFilm = -1; }
+  else if (e.code === 'KeyF') { calm = !calm; lastFilm = -1; }
+  else start();
+});
+document.addEventListener('visibilitychange', () => { if (AC) document.hidden ? AC.suspend() : AC.resume(); });
+
+// ---------- Self-check (?selftest) ----------
+async function selfTest() {
+  const ok = (c, m) => { if (!c) throw new Error(m); };
+  try {
+    render(0, 0);                                                       // start card
+    started = true;
+    let n = 0;
+    for (let e = 0; e < TITLE + LOOP * 1.25; e += 1 / FILM_FPS) render(e, n++);   // every film frame, past the loop wrap
+    const a = pose(0), b = pose(LOOP - 1e-4);
+    ok(dist(a.handR, b.handR) < 2 && dist(a.footL, b.footL) < 2 && Math.abs(a.x - b.x) < 2, 'the loop jumps at the seam');
+    const arm = (p) => dist([p.x + 20 * p.sx, p.shY], p.handR);
+    ok(arm(pose(13 * BEAT)) > 2.5 * arm(pose(2 * BEAT)), 'the arm does not stretch');
+    for (const b of [0, 8, 12, 16 - 1e-6]) {                             // every gag must be back at rest where the bars join
+      const p = pose(b * BEAT);
+      ok(p.hatLift < 0.5 && Math.abs(Math.sin(p.hatFlip)) < 0.01 && Math.abs(p.turn - 1) < 1e-6 && dogPose(b).howl === 0, 'a gag is not at rest on beat ' + b);
+    }
+    ok(pose(7.5 * BEAT).hatLift > 60 && pose(11.5 * BEAT).turn < -0.99 && dogPose(10).howl === 1, 'the hat toss, spin or howl is missing');
+    const was = calm; dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyF' }));
+    ok(calm === !was && !AC, 'F must toggle the steady picture without starting the sound'); calm = was;
+    ok(Math.abs(sawPitch(1.9) - 88) < 1e-9 && Math.abs(sawPitch(2.3) - 84) < 1e-9, 'saw pitch table');
+    const off = new OfflineAudioContext(1, 44100 * 12, 44100);
+    wire(off);
+    for (let i = 0; i < 24; i++) scheduleBeat(i, i * BEAT);             // the vamp and one whole loop
+    const d = (await off.startRendering()).getChannelData(0);
+    let peak = 0;
+    for (let i = 0; i < d.length; i++) { ok(Number.isFinite(d[i]), 'audio is not finite'); peak = Math.max(peak, Math.abs(d[i])); }
+    ok(peak > 0.05 && peak < 1, 'audio peak out of range: ' + peak.toFixed(3));
+    console.log('SELFTEST PASS (audio peak ' + peak.toFixed(2) + ', ' + n + ' frames)');
+  } catch (err) { console.error('SELFTEST FAIL: ' + err.message); }
+}
+
+if (params.has('selftest')) selfTest();
+else { if (params.has('autostart') || FREEZE !== null) started = true; requestAnimationFrame(frame); }
+</script>
+</body>
+</html>
