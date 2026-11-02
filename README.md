@@ -2,7 +2,7 @@
 
 # The Rubber Hose Revue
 
-Rubber-hose cartoon style in the browser: a cartoon and a game of Asteroids.
+A rooftop rubber-hose cartoon with a musical saw, and Cannonball Capers, an asteroids game drawn the same way.
 
 </div>
 
